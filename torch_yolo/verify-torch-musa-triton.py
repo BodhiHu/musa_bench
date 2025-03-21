@@ -1,8 +1,6 @@
 import torch_compat as torch
 import torch.nn as nn
 
-torch._logging.set_logs(dynamo=50, inductor=50)
-
 class SimpleNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super(SimpleNN, self).__init__()

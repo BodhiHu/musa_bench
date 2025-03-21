@@ -16,35 +16,6 @@ from itertools import product
 from typing import List
 from pathlib import Path
 
-DEFAULT_MODELS = [
-    #"yolov5n.pt",
-    #"yolov5s.pt",
-    #"yolov5m.pt",
-    #"yolov5l.pt",
-
-    # "yolov8n.pt",
-    # "yolov8s.pt",
-    "yolov8m.pt",
-    # "yolov8l.pt",
-
-    #"yolov10n.pt",
-    #"yolov10s.pt",
-    #"yolov10m.pt",
-    #"yolov10l.pt",
-
-    #"yolo11n.pt",
-    #"yolo11s.pt",
-    #"yolo11m.pt",
-    #"yolo11l.pt",
-
-    #"yolo12n.pt",
-    #"yolo12s.pt",
-    #"yolo12m.pt",
-    #"yolo12l.pt",
-    ]
-DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32]
-DEFAULT_DTYPES = [False, True]  # False: fp32, True: fp16
-
 torch._logging.set_logs(dynamo=50, inductor=50)
 
 def benchmark(
@@ -75,6 +46,7 @@ def benchmark(
     model = YOLO(model)
     # using triton musa backend
     if triton:
+        print("INFO: using triton backend")
         model.model = torch.compile(model.model, backend="inductor", mode="max-autotune")
     is_end2end = getattr(model.model.model[-1], "end2end", False)
     data = data or TASK2DATA[model.task]  # task to dataset, i.e. coco8.yaml for task=detect
@@ -103,6 +75,7 @@ def benchmark(
                 )
                 exported_model = YOLO(filename, task=model.task)
                 if triton:
+                    print("INFO: using triton backend")
                     exported_model.model = torch.compile(exported_model.model, backend="inductor", mode="max-autotune")
                 assert suffix in str(filename), "export failed"
             emoji = "❎"  # indicates export succeeded
@@ -168,13 +141,45 @@ def print_table_row(bf, model, size, half, batch, dataset, imgsz, triton, metric
     bf.write(f"| {model:<17}| {size:<17}| {half:<17}| {batch:<17}| {dataset:<17}| {imgsz:<17}| {triton:<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
     bf.flush()
 
+
+DEFAULT_MODELS = [
+    #"yolov5n.pt",
+    #"yolov5s.pt",
+    #"yolov5m.pt",
+    #"yolov5l.pt",
+
+    # "yolov8n.pt",
+    # "yolov8s.pt",
+    "yolov8m.pt",
+    # "yolov8l.pt",
+
+    #"yolov10n.pt",
+    #"yolov10s.pt",
+    #"yolov10m.pt",
+    #"yolov10l.pt",
+
+    #"yolo11n.pt",
+    #"yolo11s.pt",
+    #"yolo11m.pt",
+    #"yolo11l.pt",
+
+    #"yolo12n.pt",
+    #"yolo12s.pt",
+    #"yolo12m.pt",
+    #"yolo12l.pt",
+    ]
+DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32]
+DEFAULT_DTYPES = [False, True]  # False: fp32, True: fp16
+TRITON_TOGGLES = [True] # True: use triton, False: do not use triton
+
 def main(models: List[str], batches: List[int], dtypes: List[bool], dataset: str = "coco128.yaml", imgsz: int = 640, device: str = "cuda:0"):
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
     with open(f"benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
         print_table_head(bf)
-        for half, model, batch, triton, in product(dtypes, models, batches, (False, True)):
+        for half, model, batch, triton, in product(dtypes, models, batches, TRITON_TOGGLES):
             benchmark(bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch, half=half, int8=True, device=device, triton=triton)
             time.sleep(5)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run YOLO benchmarks.")
@@ -184,7 +189,11 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", default="coco128.yaml", help="Dataset configuration file (e.g., coco128.yaml).")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
     parser.add_argument("--device", default="cuda:0", help="Device to run on.")
+    parser.add_argument("--triton-toggles", action="store_true", help="If also perf without triton.")
 
     args = parser.parse_args()
+
+    if args.triton_toggles:
+        TRITON_TOGGLES.append(False)
 
     main(args.models, args.batches, args.dtypes, args.dataset, args.imgsz, args.device)
