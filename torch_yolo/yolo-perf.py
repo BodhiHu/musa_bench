@@ -45,6 +45,8 @@ DEFAULT_MODELS = [
 DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32]
 DEFAULT_DTYPES = [False, True]  # False: fp32, True: fp16
 
+torch._logging.set_logs(dynamo=50, inductor=50)
+
 def benchmark(
     bf,
     model,
@@ -73,7 +75,8 @@ def benchmark(
     model = YOLO(model)
     # using triton musa backend
     if triton:
-        model.model = torch.compile(model.model, backend="inductor")
+        model.model = torch.compile(model.model, backend="inductor", mode="max-autotune")
+        exit(0)
     is_end2end = getattr(model.model.model[-1], "end2end", False)
     data = data or TASK2DATA[model.task]  # task to dataset, i.e. coco8.yaml for task=detect
     key = TASK2METRIC[model.task]  # task to metric, i.e. metrics/mAP50-95(B) for task=detect
@@ -101,7 +104,7 @@ def benchmark(
                 )
                 exported_model = YOLO(filename, task=model.task)
                 if triton:
-                    exported_model.model = torch.compile(exported_model.model, backend="inductor")
+                    exported_model.model = torch.compile(exported_model.model, backend="inductor", mode="max-autotune")
                 assert suffix in str(filename), "export failed"
             emoji = "❎"  # indicates export succeeded
 
