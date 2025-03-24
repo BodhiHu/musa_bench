@@ -2,6 +2,8 @@
 
 from datetime import datetime
 import torch_compat as torch;
+# import torch
+import torch_musa
 from ultralytics import YOLO
 from ultralytics.cfg import TASK2DATA, TASK2METRIC
 from ultralytics.engine.exporter import export_formats
@@ -16,7 +18,10 @@ from itertools import product
 from typing import List
 from pathlib import Path
 
-torch._logging.set_logs(dynamo=50, inductor=50)
+# torch._logging.set_logs(dynamo=50, inductor=50)
+
+DEFAULT_DEVICE = "musa:0"
+# DEFAULT_DEVICE = "cuda:0"
 
 def benchmark(
     bf,
@@ -46,8 +51,9 @@ def benchmark(
     model = YOLO(model)
     # using triton musa backend
     if triton:
-        print("INFO: using triton backend")
+        print("INFO: using triton backend for model")
         model.model = torch.compile(model.model, backend="inductor", mode="max-autotune")
+        # exit(0)
     is_end2end = getattr(model.model.model[-1], "end2end", False)
     data = data or TASK2DATA[model.task]  # task to dataset, i.e. coco8.yaml for task=detect
     key = TASK2METRIC[model.task]  # task to metric, i.e. metrics/mAP50-95(B) for task=detect
@@ -74,9 +80,11 @@ def benchmark(
                     imgsz=imgsz, format=format, half=half, int8=int8, data=data, device=device, verbose=False
                 )
                 exported_model = YOLO(filename, task=model.task)
+
                 if triton:
-                    print("INFO: using triton backend")
+                    print("INFO: using triton backend for exported_model")
                     exported_model.model = torch.compile(exported_model.model, backend="inductor", mode="max-autotune")
+
                 assert suffix in str(filename), "export failed"
             emoji = "❎"  # indicates export succeeded
 
@@ -172,9 +180,9 @@ DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32]
 DEFAULT_DTYPES = [False, True]  # False: fp32, True: fp16
 TRITON_TOGGLES = [True] # True: use triton, False: do not use triton
 
-def main(models: List[str], batches: List[int], dtypes: List[bool], dataset: str = "coco128.yaml", imgsz: int = 640, device: str = "cuda:0"):
+def main(models: List[str], batches: List[int], dtypes: List[bool], dataset: str = "coco128.yaml", imgsz: int = 640, device: str = DEFAULT_DEVICE):
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
-    with open(f"benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
+    with open(f"logs/benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
         print_table_head(bf)
         for half, model, batch, triton, in product(dtypes, models, batches, TRITON_TOGGLES):
             benchmark(bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch, half=half, int8=True, device=device, triton=triton)
@@ -188,7 +196,7 @@ if __name__ == "__main__":
     parser.add_argument("--dtypes", nargs="+", type=lambda x: x.lower() == 'true', default=DEFAULT_DTYPES, help="List of dtypes to test (False for fp32, True for fp16).")
     parser.add_argument("--dataset", default="coco128.yaml", help="Dataset configuration file (e.g., coco128.yaml).")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
-    parser.add_argument("--device", default="cuda:0", help="Device to run on.")
+    parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
     parser.add_argument("--triton-toggles", action="store_true", help="If also perf without triton.")
 
     args = parser.parse_args()

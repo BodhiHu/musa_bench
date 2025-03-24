@@ -1,5 +1,7 @@
-import torch_compat as torch
+# import torch_compat as torch
+import torch
 import torch.nn as nn
+import torch_musa
 
 class SimpleNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -15,7 +17,7 @@ class SimpleNN(nn.Module):
         return x
 
 
-device = torch.device("cuda")
+device = torch.device("musa")
 model = SimpleNN(input_size=10, hidden_size=20, output_size=1).to(device)
 model = torch.compile(model, backend="inductor", mode="max-autotune")
 # print(f"\n>> backend = \n{model._compiled_model.backend}\n\n")
