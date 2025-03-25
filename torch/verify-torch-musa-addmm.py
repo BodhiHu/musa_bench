@@ -46,6 +46,6 @@ def test_addmm(addmm=torch.addmm, grad=False):
   print(">> buf1 =\n", buf1)
 
 
-for grad in (False, True):
-  test_addmm(grad=grad)
-
+# for grad in (False, True):
+test_addmm(grad=False)
+test_addmm(grad=True)
