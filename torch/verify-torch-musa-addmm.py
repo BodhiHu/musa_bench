@@ -7,19 +7,21 @@ def test_addmm(addmm=torch.addmm, grad=False):
   # addmm = torch.addmm
   # addmm = extern_kernels.addmm
 
-  device = torch.device("musa")
+  device = torch.device("musa:0")
 
   primals_2 = torch.tensor(
     [0.2069, 0.3700],
-    device='musa:0', requires_grad=grad)
+    device=device, requires_grad=grad)
   primals_3 = torch.tensor(
     [[-1.4669,  0.1403],
-     [-0.7819,  0.4707]], device='musa:0')
+     [-0.7819,  0.4707]],
+    device=device)
   primals_1 = torch.tensor(
     [[ 0.5870,  0.4790],
-     [-0.2002,  0.3976]], device='musa:0', requires_grad=grad)
+     [-0.2002,  0.3976]],
+    device=device, requires_grad=grad)
 
-  buf0 = torch.empty((2, 2), device='musa', dtype=torch.float32)
+  buf0 = torch.empty((2, 2), device=device, dtype=torch.float32)
 
   addmm(
     primals_2,
@@ -30,9 +32,10 @@ def test_addmm(addmm=torch.addmm, grad=False):
   )
   print(">> buf0 =\n", buf0)
 
-  buf1 = torch.empty((2, 2), device='musa', dtype=torch.float32)
+  buf1 = torch.empty((2, 2), device=device, dtype=torch.float32)
   A = reinterpret_tensor(primals_2, (2, 2), (0, 1), 0)
   B = reinterpret_tensor(primals_1, (2, 2), (1, 2), 0)
+  # A = A.contiguous()
   print(">> reinterpreted tensors:")
   print(">> A:\n", A)
   print(">> B:\n", B)
@@ -48,4 +51,4 @@ def test_addmm(addmm=torch.addmm, grad=False):
 
 # for grad in (False, True):
 test_addmm(grad=False)
-test_addmm(grad=True)
+# test_addmm(grad=True)

@@ -7,6 +7,7 @@ import torch.profiler
 
 USE_INDUCTOR = True
 PROFILING_ON = True
+device = torch.device("musa")
 
 class SimpleNN(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -23,10 +24,10 @@ class SimpleNN(nn.Module):
         # x = self.fc2(x)
         return x
 
-
-device = torch.device("musa")
 # model = SimpleNN(input_size=10, hidden_size=20, output_size=1).to(device)
 model = SimpleNN(input_size=2, hidden_size=2, output_size=2).to(device)
+for param in model.parameters():
+    param.requires_grad = False
 if USE_INDUCTOR:
     model = torch.compile(model, backend="inductor", mode="max-autotune")
 # print(f"\n>> backend = \n{model._compiled_model.backend}\n\n")
@@ -37,7 +38,8 @@ if USE_INDUCTOR:
 x = torch.randn(2, 2).to(device)
 
 if not PROFILING_ON:
-    output = model(x)
+    with torch.no_grad():
+        output = model(x)
 else:
     with torch.profiler.profile(
         activities=[
@@ -47,7 +49,9 @@ else:
         ],
         record_shapes=True,
         profile_memory=True,
-        with_stack=True
+        with_stack=True,
+        with_flops=True,
+        with_modules=True,
     ) as prof:
         with torch.no_grad():
             output = model(x)
