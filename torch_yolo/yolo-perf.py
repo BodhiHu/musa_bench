@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import logging
 import torch
 import torch_musa
 from datetime import datetime
@@ -18,19 +19,64 @@ from itertools import product
 from typing import List
 from pathlib import Path
 
-# torch._logging.set_logs(dynamo=50, inductor=50)
-
-# DEFAULT_DEVICE = "musa:0"
-DEFAULT_DEVICE = "cuda:0"
-
 try:
     import torch_musa.cuda_compat
 except Exception as exc:
-    print("WARN: could not import torch_musa.cuda_compat exc: ", exc)
+    print("WARN: could not import torch_musa.cuda_compat: ", exc)
     print("WARN: fall back to manual cuda compat")
     # fallback to manual cuda compat
     del torch.cuda
     torch.cuda = torch.musa
+
+
+logging.basicConfig(
+    level=logging.DEBUG, 
+    # format="%(asctime)s - %(levelname)s - %(message)s",
+)
+# Ensure the root logger captures debug messages
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+torch._logging.set_logs(
+    all                 = logging.DEBUG,
+    dynamo              = logging.DEBUG,
+    aot                 = logging.DEBUG,
+    dynamic             = logging.DEBUG,
+    inductor            = logging.DEBUG,
+    distributed         = logging.DEBUG,
+    onnx                = logging.DEBUG,
+
+    bytecode            = True,
+    aot_graphs          = True,
+    aot_joint_graph     = True,
+    ddp_graphs          = True,
+    graph               = True,
+    graph_code          = True,
+    graph_breaks        = True,
+    graph_sizes         = True,
+    guards              = True,
+    recompiles          = True,
+    recompiles_verbose  = True,
+    trace_source        = True,
+    trace_call          = True,
+    output_code         = True,
+    schedule            = True,
+    perf_hints          = True,
+    post_grad_graphs    = True,
+    onnx_diagnostics    = True,
+    fusion              = True,
+    overlap             = True,
+)
+
+def verify_env():
+    def test_fn(x):
+        return x.sin()
+
+    x = torch.randn(10, device="musa")
+    compiled_fn = torch.compile(test_fn, backend="inductor")
+    compiled_fn(x)
+# verify_env()
+# exit(0)
+
 
 def benchmark(
     bf,
@@ -192,13 +238,15 @@ DEFAULT_DTYPES = [
     True   # fp16
 ]
 TRITON_TOGGLES = [True] # True: use triton, False: do not use triton
+DEFAULT_DEVICE = "cuda:0" # musa is compatible with both "musa" & "cuda" ! Thanks to our community efforts!
+# DEFAULT_DEVICE = "musa:0"
 
-cwd = os.path.dirname(os.path.abspath(__file__))
+CWD = os.path.dirname(os.path.abspath(__file__))
 
 def main(models: List[str], batches: List[int], dtypes: List[bool], dataset: str = "coco128.yaml", imgsz: int = 640, device: str = DEFAULT_DEVICE):
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
-    os.makedirs(f"{cwd}/logs/", exist_ok=True)
-    with open(f"{cwd}/logs/benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
+    os.makedirs(f"{CWD}/benchmarks/", exist_ok=True)
+    with open(f"{CWD}/benchmarks/benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
         print_table_head(bf)
         for half, model, batch, triton, in product(dtypes, models, batches, TRITON_TOGGLES):
             benchmark(bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch, half=half, int8=True, device=device, triton=triton)

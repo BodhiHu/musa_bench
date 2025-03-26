@@ -9,14 +9,21 @@ pip install numpy==1.23
 ```
 
 AiBook 1.2.0 latest packages：
-> NOTE: for M1000 developers, you need to get the torch_musa v1.3.2/m1000-dev branch and build pip wheel from source.
 ```bash
-pip insall https://oss.mthreads.com/mt-ai-data/ci-release/torch_musa/AIBook/20250113/torch_musa-1.3.2-cp310-cp310-linux_aarch64.whl
-pip insall https://oss.mthreads.com/mt-ai-data/ci-release/torch_musa/AIBook/20250113/torch-2.2.0-cp310-cp310-linux_aarch64.whl
+# install torch & torch_musa
+# NOTE: for M1000 developers, you need to get the torch_musa v1.3.2/m1000-dev branch and build pip wheel from source.
+# see torch_musa for how to build & install torch & torch_musa from source.
+# pip insall https://oss.mthreads.com/mt-ai-data/ci-release/torch_musa/AIBook/20250113/torch_musa-1.3.2-cp310-cp310-linux_aarch64.whl
+# pip insall https://oss.mthreads.com/mt-ai-data/ci-release/torch_musa/AIBook/20250113/torch-2.2.0-cp310-cp310-linux_aarch64.whl
+
+# install torchvision & torchaudio
 pip insall https://oss.mthreads.com/mt-ai-data/ci-release/torch_musa/AIBook/20250113/torchvision-0.17.2+c1d70fe-cp310-cp310-linux_aarch64.whl
 pip insall https://oss.mthreads.com/mt-ai-data/ci-release/torch_musa/AIBook/20250113/torchaudio-2.2.2+cefdb36-cp310-cp310-linux_aarch64.whl
-pip insall https://oss.mthreads.com/ai-product/aipc/triton/triton-3.0.0-cp310-cp310-linux_aarch64.whl
 
+# install triton:
+wget https://oss.mthreads.com/product-release/release_M1000_1.2.2/20250319/M1000_triton.tar.gz
+tar -zxvf M1000_triton.tar.gz
+pip install <extracted-whl-pkg>
 ```
 
 (Optional):
