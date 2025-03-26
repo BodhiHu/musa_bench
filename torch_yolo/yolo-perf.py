@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-from datetime import datetime
-import torch_compat as torch;
-# import torch
+import os
+import torch
 import torch_musa
+from datetime import datetime
 from ultralytics import YOLO
 from ultralytics.cfg import TASK2DATA, TASK2METRIC
 from ultralytics.engine.exporter import export_formats
@@ -20,8 +20,17 @@ from pathlib import Path
 
 # torch._logging.set_logs(dynamo=50, inductor=50)
 
-DEFAULT_DEVICE = "musa:0"
-# DEFAULT_DEVICE = "cuda:0"
+# DEFAULT_DEVICE = "musa:0"
+DEFAULT_DEVICE = "cuda:0"
+
+try:
+    import torch_musa.cuda_compat
+except Exception as exc:
+    print("WARN: could not import torch_musa.cuda_compat exc: ", exc)
+    print("WARN: fall back to manual cuda compat")
+    # fallback to manual cuda compat
+    del torch.cuda
+    torch.cuda = torch.musa
 
 def benchmark(
     bf,
@@ -53,7 +62,6 @@ def benchmark(
     if triton:
         print("INFO: using triton backend for model")
         model.model = torch.compile(model.model, backend="inductor", mode="max-autotune")
-        # exit(0)
     is_end2end = getattr(model.model.model[-1], "end2end", False)
     data = data or TASK2DATA[model.task]  # task to dataset, i.e. coco8.yaml for task=detect
     key = TASK2METRIC[model.task]  # task to metric, i.e. metrics/mAP50-95(B) for task=detect
@@ -180,9 +188,12 @@ DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32]
 DEFAULT_DTYPES = [False, True]  # False: fp32, True: fp16
 TRITON_TOGGLES = [True] # True: use triton, False: do not use triton
 
+cwd = os.path.dirname(os.path.abspath(__file__))
+
 def main(models: List[str], batches: List[int], dtypes: List[bool], dataset: str = "coco128.yaml", imgsz: int = 640, device: str = DEFAULT_DEVICE):
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
-    with open(f"logs/benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
+    os.makedirs(f"{cwd}/logs/", exist_ok=True)
+    with open(f"{cwd}/logs/benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
         print_table_head(bf)
         for half, model, batch, triton, in product(dtypes, models, batches, TRITON_TOGGLES):
             benchmark(bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch, half=half, int8=True, device=device, triton=triton)
