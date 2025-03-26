@@ -184,8 +184,13 @@ DEFAULT_MODELS = [
     #"yolo12m.pt",
     #"yolo12l.pt",
     ]
-DEFAULT_BATCHES = [1, 2, 4, 8, 16, 32]
-DEFAULT_DTYPES = [False, True]  # False: fp32, True: fp16
+DEFAULT_BATCHES = [
+    1, #2, 4, 8, 16, 32
+]
+DEFAULT_DTYPES = [
+    # False, # fp32
+    True   # fp16
+]
 TRITON_TOGGLES = [True] # True: use triton, False: do not use triton
 
 cwd = os.path.dirname(os.path.abspath(__file__))
