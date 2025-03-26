@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import os
+import numpy as np
 import logging
+import platform
 import torch
 import torch_musa
 from datetime import datetime
@@ -18,6 +20,7 @@ import time
 from itertools import product
 from typing import List
 from pathlib import Path
+from typing import Literal
 
 try:
     import torch_musa.cuda_compat
@@ -28,54 +31,134 @@ except Exception as exc:
     del torch.cuda
     torch.cuda = torch.musa
 
+DEFAULT_MODELS = [
+    #"yolov5n.pt",
+    #"yolov5s.pt",
+    #"yolov5m.pt",
+    #"yolov5l.pt",
 
-logging.basicConfig(
-    level=logging.DEBUG, 
-    # format="%(asctime)s - %(levelname)s - %(message)s",
-)
-# Ensure the root logger captures debug messages
-logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)
-torch._logging.set_logs(
-    all                 = logging.DEBUG,
-    dynamo              = logging.DEBUG,
-    aot                 = logging.DEBUG,
-    dynamic             = logging.DEBUG,
-    inductor            = logging.DEBUG,
-    distributed         = logging.DEBUG,
-    onnx                = logging.DEBUG,
+    # "yolov8n.pt",
+    # "yolov8s.pt",
+    "yolov8m.pt",
+    # "yolov8l.pt",
 
-    bytecode            = True,
-    aot_graphs          = True,
-    aot_joint_graph     = True,
-    ddp_graphs          = True,
-    graph               = True,
-    graph_code          = True,
-    graph_breaks        = True,
-    graph_sizes         = True,
-    guards              = True,
-    recompiles          = True,
-    recompiles_verbose  = True,
-    trace_source        = True,
-    trace_call          = True,
-    output_code         = True,
-    schedule            = True,
-    perf_hints          = True,
-    post_grad_graphs    = True,
-    onnx_diagnostics    = True,
-    fusion              = True,
-    overlap             = True,
-)
+    #"yolov10n.pt",
+    #"yolov10s.pt",
+    #"yolov10m.pt",
+    #"yolov10l.pt",
 
-def verify_env():
-    def test_fn(x):
-        return x.sin()
+    #"yolo11n.pt",
+    #"yolo11s.pt",
+    #"yolo11m.pt",
+    #"yolo11l.pt",
 
-    x = torch.randn(10, device="musa")
-    compiled_fn = torch.compile(test_fn, backend="inductor")
-    compiled_fn(x)
-# verify_env()
-# exit(0)
+    #"yolo12n.pt",
+    #"yolo12s.pt",
+    #"yolo12m.pt",
+    #"yolo12l.pt",
+    ]
+DEFAULT_BATCHES = [
+    1, #2, 4, 8, 16, 32
+]
+DEFAULT_DTYPES = [
+    # False, # fp32
+    True   # fp16
+]
+TRITON_TOGGLES = [True]
+DEFAULT_DEVICE = "cuda:0"
+# DEFAULT_DEVICE = "musa:0"
+CWD = os.path.dirname(os.path.abspath(__file__))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run YOLO benchmarks.")
+    parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS, help="List of models to benchmark.")
+    parser.add_argument("--batches", nargs="+", type=int, default=DEFAULT_BATCHES, help="List of batch to test.")
+    parser.add_argument("--dtypes", nargs="+", type=lambda x: x.lower() == 'true', default=DEFAULT_DTYPES, help="List of dtypes to test (False for fp32, True for fp16).")
+    parser.add_argument("--dataset", default="coco128.yaml", help="Dataset configuration file (e.g., coco128.yaml).")
+    parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
+    parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
+    parser.add_argument("-tt", "--triton-toggles", action="store_true", help="If also perf without triton.")
+    parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
+    parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env only.")
+
+    args = parser.parse_args()
+
+    if args.triton_toggles:
+        TRITON_TOGGLES.insert(0, False)
+    return args
+
+args = parse_args()
+
+
+if args.debug:
+    logging.basicConfig(
+        level=logging.DEBUG, 
+        # format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    # Ensure the root logger captures debug messages
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    torch._logging.set_logs(
+        all                 = logging.DEBUG,
+        dynamo              = logging.DEBUG,
+        aot                 = logging.DEBUG,
+        dynamic             = logging.DEBUG,
+        inductor            = logging.DEBUG,
+        distributed         = logging.DEBUG,
+        onnx                = logging.DEBUG,
+
+        bytecode            = True,
+        aot_graphs          = True,
+        aot_joint_graph     = True,
+        ddp_graphs          = True,
+        graph               = True,
+        graph_code          = True,
+        graph_breaks        = True,
+        graph_sizes         = True,
+        guards              = True,
+        recompiles          = True,
+        recompiles_verbose  = True,
+        trace_source        = True,
+        trace_call          = True,
+        output_code         = True,
+        schedule            = True,
+        perf_hints          = True,
+        post_grad_graphs    = True,
+        onnx_diagnostics    = True,
+        fusion              = True,
+        overlap             = True,
+    )
+
+def verify_musa(choice: Literal["simple", "naive-yolo"], verify_only = False):
+    if choice == "simple":
+        def simple_fn(x):
+            return x.sin()
+
+        x = torch.randn(10, device="cuda")
+        compiled_fn = torch.compile(simple_fn, backend="inductor")
+        compiled_fn(x)
+        print("INFO: >> ✔ simple_fn test pass")
+
+    if choice == "naive-yolo":
+        model_path = "yolov8m.pt"
+        model_data = torch.load(model_path, map_location="cuda")
+        model = model_data["model"].float().eval()
+        print(f">> model = {type(model)}\n")
+        model = torch.compile(model, backend="inductor", mode="max-autotune")
+        input_tensor = np.load('img_0.npy')
+        input_tensor = torch.from_numpy(input_tensor).to("cuda")
+        with torch.no_grad():
+            model(input_tensor)
+            print("INFO: >> ✔ yolov8m naive test pass")
+
+    if verify_only:
+        exit(0)
+
+if args.verify_musa:
+    # verify_musa("simple")
+    verify_musa("naive-yolo", verify_only=False)
+    exit(0)
 
 
 def benchmark(
@@ -103,11 +186,22 @@ def benchmark(
     pd.options.display.max_columns = 10
     pd.options.display.width = 120
     device = select_device(device, verbose=False)
+
+    def may_load_triton_model(model: YOLO):
+        # using triton musa backend
+        if triton:
+            print(f"INFO: using triton backend for model {type(model.model)} on {device}")
+            # model.model.to(device)
+            model.model.to(device).eval()
+            model.model = torch.compile(
+                model.model,
+                backend="inductor",
+                mode="max-autotune"
+            )
+
     model = YOLO(model)
-    # using triton musa backend
-    if triton:
-        print("INFO: using triton backend for model")
-        model.model = torch.compile(model.model, backend="inductor", mode="max-autotune")
+    may_load_triton_model(model)
+
     is_end2end = getattr(model.model.model[-1], "end2end", False)
     data = data or TASK2DATA[model.task]  # task to dataset, i.e. coco8.yaml for task=detect
     key = TASK2METRIC[model.task]  # task to metric, i.e. metrics/mAP50-95(B) for task=detect
@@ -124,6 +218,7 @@ def benchmark(
         try:
             if format_arg and format_arg != format:
                 continue
+            assert i == 0
 
             # Export
             if format == "-":
@@ -134,20 +229,11 @@ def benchmark(
                     imgsz=imgsz, format=format, half=half, int8=int8, data=data, device=device, verbose=False
                 )
                 exported_model = YOLO(filename, task=model.task)
-
-                if triton:
-                    print("INFO: using triton backend for exported_model")
-                    exported_model.model = torch.compile(exported_model.model, backend="inductor", mode="max-autotune")
+                may_load_triton_model(exported_model)
 
                 assert suffix in str(filename), "export failed"
             emoji = "❎"  # indicates export succeeded
 
-            # Predict
-            assert model.task != "pose" or i != 7, "GraphDef Pose inference is not supported"
-            assert i not in {9, 10}, "inference not supported"  # Edge TPU and TF.js are unsupported
-            assert i != 5 or platform.system() == "Darwin", "inference only supported on macOS>=10.13"  # CoreML
-            if i in {13}:
-                assert not is_end2end, "End-to-end torch.topk operation is not supported for NCNN prediction yet"
             exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
 
             # Validate
@@ -204,45 +290,6 @@ def print_table_row(bf, model, size, half, batch, dataset, imgsz, triton, metric
     bf.flush()
 
 
-DEFAULT_MODELS = [
-    #"yolov5n.pt",
-    #"yolov5s.pt",
-    #"yolov5m.pt",
-    #"yolov5l.pt",
-
-    # "yolov8n.pt",
-    # "yolov8s.pt",
-    "yolov8m.pt",
-    # "yolov8l.pt",
-
-    #"yolov10n.pt",
-    #"yolov10s.pt",
-    #"yolov10m.pt",
-    #"yolov10l.pt",
-
-    #"yolo11n.pt",
-    #"yolo11s.pt",
-    #"yolo11m.pt",
-    #"yolo11l.pt",
-
-    #"yolo12n.pt",
-    #"yolo12s.pt",
-    #"yolo12m.pt",
-    #"yolo12l.pt",
-    ]
-DEFAULT_BATCHES = [
-    1, #2, 4, 8, 16, 32
-]
-DEFAULT_DTYPES = [
-    # False, # fp32
-    True   # fp16
-]
-TRITON_TOGGLES = [True] # True: use triton, False: do not use triton
-DEFAULT_DEVICE = "cuda:0" # musa is compatible with both "musa" & "cuda" ! Thanks to our community efforts!
-# DEFAULT_DEVICE = "musa:0"
-
-CWD = os.path.dirname(os.path.abspath(__file__))
-
 def main(models: List[str], batches: List[int], dtypes: List[bool], dataset: str = "coco128.yaml", imgsz: int = 640, device: str = DEFAULT_DEVICE):
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
     os.makedirs(f"{CWD}/benchmarks/", exist_ok=True)
@@ -254,18 +301,4 @@ def main(models: List[str], batches: List[int], dtypes: List[bool], dataset: str
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run YOLO benchmarks.")
-    parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS, help="List of models to benchmark.")
-    parser.add_argument("--batches", nargs="+", type=int, default=DEFAULT_BATCHES, help="List of batch to test.")
-    parser.add_argument("--dtypes", nargs="+", type=lambda x: x.lower() == 'true', default=DEFAULT_DTYPES, help="List of dtypes to test (False for fp32, True for fp16).")
-    parser.add_argument("--dataset", default="coco128.yaml", help="Dataset configuration file (e.g., coco128.yaml).")
-    parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
-    parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
-    parser.add_argument("--triton-toggles", action="store_true", help="If also perf without triton.")
-
-    args = parser.parse_args()
-
-    if args.triton_toggles:
-        TRITON_TOGGLES.append(False)
-
     main(args.models, args.batches, args.dtypes, args.dataset, args.imgsz, args.device)
