@@ -38,8 +38,14 @@ vllm：     https://oss.mthreads.com/ai-product/aipc/mtt/vllm-0.4.2+musa-cp310-c
 This will show how to train YOLO model and run inference on MUSA GPU.
 
 Install yolo pip package:
+
 ```sh
-pip install ultralytics
+# pip install ultralytics
+pip install setuptools wheel build
+git clone git@sh-code.mthreads.com:m1000-sw/ultralytics.git
+cd ultralytics
+python -m build --wheel
+pip install dist/<biult-whl-pkg>
 ```
 
 Download sample imgs：
