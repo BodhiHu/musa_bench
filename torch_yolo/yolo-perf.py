@@ -32,6 +32,9 @@ except Exception as exc:
     del torch.cuda
     torch.cuda = torch.musa
 
+
+# torch._dynamo.config.cache_size_limit = 128
+
 DEFAULT_MODELS = [
     #"yolov5n.pt",
     #"yolov5s.pt",
@@ -62,8 +65,9 @@ DEFAULT_BATCHES = [
     1, #2, 4, 8, 16, 32
 ]
 DEFAULT_DTYPES = [
-    # False, # fp32
-    True   # fp16
+    # "fp32",
+    "fp16",
+    # "int8"
 ]
 TRITON_TOGGLES = [True]
 DEFAULT_DEVICE = "cuda:0"
@@ -72,7 +76,8 @@ COMPILE_MODES = [
     "default",
     "reduce-overhead",
     "max-autotune",
-    "max-autotune-no-cudagraphs"
+    "max-autotune-no-cudagraphs",
+    "default",
 ]
 CWD = os.path.dirname(os.path.abspath(__file__))
 
@@ -81,7 +86,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run YOLO benchmarks.")
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS, help="List of models to benchmark.")
     parser.add_argument("--batches", nargs="+", type=int, default=DEFAULT_BATCHES, help="List of batch to test.")
-    parser.add_argument("--dtypes", nargs="+", type=lambda x: x.lower() == 'true', default=DEFAULT_DTYPES, help="List of dtypes to test (False for fp32, True for fp16).")
     parser.add_argument("--dataset", default="coco128.yaml", help="Dataset configuration file (e.g., coco128.yaml).")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
@@ -99,13 +103,13 @@ args = parse_args()
 
 
 if args.debug:
-    logging.basicConfig(
-        level=logging.DEBUG, 
-        # format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-    # Ensure the root logger captures debug messages
-    logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
+    # logging.basicConfig(
+    #     level=logging.DEBUG, 
+    #     # format="%(asctime)s - %(levelname)s - %(message)s",
+    # )
+    # # Ensure the root logger captures debug messages
+    # logger = logging.getLogger()
+    # logger.setLevel(logging.DEBUG)
     torch._logging.set_logs(
         # all                 = logging.DEBUG,
         # dynamo              = logging.DEBUG,
@@ -124,11 +128,11 @@ if args.debug:
         # graph_breaks        = True,
         # graph_sizes         = True,
         # guards              = True,
-        # recompiles          = True,
+        recompiles          = True,
         # recompiles_verbose  = True,
         # trace_source        = True,
         # trace_call          = True,
-        output_code         = True,
+        # output_code         = True,
         # schedule            = True,
         # perf_hints          = True,
         # post_grad_graphs    = True,
@@ -175,13 +179,14 @@ def benchmark(
     batch=1,
     half=False,
     int8=False,
+    dtype="fp32",
     device="cpu",
     verbose=False,
     eps=1e-3,
     format="-",
     triton=True,
     compile_mode="default",
-    trial_run=False
+    warmup=False,
 ):
 
     model_name = model
@@ -195,9 +200,13 @@ def benchmark(
     pd.options.display.width = 120
     device = select_device(device, verbose=False)
 
-    def may_load_triton_model(model: YOLO):
+    def may_compile_and_quant(model: YOLO):
         if triton:
-            if not trial_run:
+            if type(model.model) == str:
+                print(f"WARN: will not call compile for model.model of type = {type(model.model)}")
+                return
+
+            if not warmup:
                 print(f"INFO: compile model {type(model.model)} on {device}, mode = {compile_mode}")
             model.model.to(device).eval()
             model.model = torch.compile(
@@ -205,14 +214,21 @@ def benchmark(
                 backend="inductor",
                 mode=compile_mode
             )
-            # if trial_run:
+            # if warmup:
             #     input_tensor = np.load('img_0.npy')
             #     input_tensor = torch.from_numpy(input_tensor).to("cuda")
             #     with torch.no_grad():
             #         model.model(input_tensor)
 
+        if dtype == "int8":
+            print(f"INFO: quantize model {type(model)} to {dtype}")
+            model.model = torch.quantization.quantize_dynamic(
+                model.model,
+                dtype=torch.qint8
+            )
+
     model = YOLO(model)
-    may_load_triton_model(model)
+    may_compile_and_quant(model)
 
     is_end2end = getattr(model.model.model[-1], "end2end", False)
     data = data or TASK2DATA[model.task]  # task to dataset, i.e. coco8.yaml for task=detect
@@ -222,36 +238,41 @@ def benchmark(
     t0 = time.time()
 
     format_arg = format.lower()
-    if format_arg:
-        formats = frozenset(export_formats()["Argument"])
-        assert format in formats, f"Expected format to be one of {formats}, but got '{format_arg}'."
+    # if format_arg:
+    #     formats = frozenset(export_formats()["Argument"])
+    #     assert format in formats, f"Expected format to be one of {formats}, but got '{format_arg}'."
 
     for i, (name, format, suffix, cpu, gpu, _) in enumerate(zip(*export_formats().values())):
         emoji, filename = "❌", None  # export defaults
         try:
             if format_arg and format_arg != format:
                 continue
-            assert i == 0
 
-            # Export
+            print(f"INFO: format = {format}, dtype = {dtype}")
             if format == "-":
                 filename = model.pt_path or model.ckpt_path or model.model_name
                 exported_model = model  # PyTorch format
-            else:
+            elif format == 'torchscript':
+                print(f"INFO: dtype={dtype}, export model to torchscript")
                 filename = model.export(
-                    imgsz=imgsz, format=format, half=half, int8=int8, data=data, device=device, verbose=False
+                    imgsz=imgsz, format="torchscript",
+                    batch=batch, optimize=True,
+                    half=half,
+                    int8=int8,
+                    data=data,
+                    device="cpu",
+                    verbose=True
                 )
+                print("INFO: exported to", filename)
                 exported_model = YOLO(filename, task=model.task)
-                may_load_triton_model(exported_model)
+                may_compile_and_quant(exported_model)
 
-                assert suffix in str(filename), "export failed"
             emoji = "❎"  # indicates export succeeded
 
-            if trial_run:
-                exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
-                return
-
             exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
+
+            if warmup:
+                return
 
             # Validate
             results = exported_model.val(
@@ -274,7 +295,7 @@ def benchmark(
     dt = time.time() - t0
 
     row = y[0]
-    print_table_row(bf, model_name, row[2], half, batch, data, imgsz, triton, compile_mode, row[3], row[4], row[5])
+    print_table_row(bf, model_name, row[2], dtype, batch, data, imgsz, triton, compile_mode, row[3], row[4], row[5])
 
     legend = "Benchmarks legend:  - ✅ Success  - ❎ Export passed but validation failed  - ❌️ Export failed"
     s = f"\nBenchmarks complete for {name} on {data} at imgsz={imgsz} ({dt:.2f}s)\n{legend}\n{df.fillna('-')}\n"
@@ -298,34 +319,53 @@ tr:nth-child(even) { background-color: rgba(99,99,99,0.3); }
 </style>
 
 """)
-    bf.write(f"| Model            | Size             | half             | batch            | dataset          | imgsz            | compile(triton)  | mAP50-95(B)      | ms/im            | FPS              |\n")
+    bf.write(f"| Model            | Size             | dtype            | batch            | dataset          | imgsz            | compile(triton)  | mAP50-95(B)      | ms/im            | FPS              |\n")
     bf.write(f"| :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: |\n")
     bf.flush()
 
-def print_table_row(bf, model, size, half, batch, dataset, imgsz, triton, compile_mode, metrics_mAP50, ms_per_img, fps):
+def print_table_row(bf, model, size, dtype, batch, dataset, imgsz, triton, compile_mode, metrics_mAP50, ms_per_img, fps):
     if triton:
-        bf.write(f"| {model:<17}| {size:<17}| {half:<17}| {batch:<17}| {dataset:<17}| {imgsz:<17}| {(compile_mode):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
+        bf.write(f"| {model:<17}| {size:<17}| {dtype:<17}| {batch:<17}| {dataset:<17}| {imgsz:<17}| {(compile_mode):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
     else:
-        bf.write(f"| {model:<17}| {size:<17}| {half:<17}| {batch:<17}| {dataset:<17}| {imgsz:<17}| {(triton):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
+        bf.write(f"| {model:<17}| {size:<17}| {dtype:<17}| {batch:<17}| {dataset:<17}| {imgsz:<17}| {(triton):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
     bf.flush()
 
 
-def main(models: List[str], batches: List[int], dtypes: List[bool], dataset: str = "coco128.yaml", imgsz: int = 640, device: str = DEFAULT_DEVICE):
+def main(models: List[str],
+         batches: List[int],
+         dataset: str = "coco128.yaml",
+         imgsz: int = 640,
+         device: str = DEFAULT_DEVICE,
+         dtypes: List[bool] = DEFAULT_DTYPES):
+
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
     os.makedirs(f"{CWD}/benchmarks/", exist_ok=True)
     with open(f"{CWD}/benchmarks/benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
         print_table_head(bf)
-        for half, model, batch, triton, in product(dtypes, models, batches, TRITON_TOGGLES):
+        for dtype, model, batch, triton, in product(dtypes, models, batches, TRITON_TOGGLES):
+            half = dtype == "fp16"
+            int8 = dtype == "int8"
             if triton:
-                print("\n")
-                benchmark(bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch, half=half, int8=True, device=device, triton=triton, compile_mode="default", trial_run=True)
+                print("INFO: torch compile warming up...")
+                benchmark(
+                    bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
+                    half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode="default", warmup=True
+                )
                 for compile_mode in COMPILE_MODES:
-                    benchmark(bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch, half=half, int8=True, device=device, triton=triton, compile_mode=compile_mode)
+                    print("\n")
+                    benchmark(
+                        bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
+                        half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode
+                    )
             else:
-                benchmark(bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch, half=half, int8=True, device=device, triton=triton)
+                print("\n")
+                benchmark(
+                    bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
+                    half=half, int8=int8, dtype=dtype, device=device, triton=triton
+                )
 
             time.sleep(1)
 
 
 if __name__ == "__main__":
-    main(args.models, args.batches, args.dtypes, args.dataset, args.imgsz, args.device)
+    main(args.models, args.batches, args.dataset, args.imgsz, args.device)

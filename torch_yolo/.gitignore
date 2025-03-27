@@ -3,3 +3,4 @@ runs/
 benchmarks-*
 *.pt
 torch_compile_debug
+**/*.torchscript
