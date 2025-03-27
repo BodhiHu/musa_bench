@@ -62,10 +62,11 @@ DEFAULT_MODELS = [
     #"yolo12l.pt",
     ]
 DEFAULT_BATCHES = [
-    1, #2, 4, 8, 16, 32
+    1,
+    # 2, 4, 8, 16, 32
 ]
 DEFAULT_DTYPES = [
-    # "fp32",
+    "fp32",
     "fp16",
     # "int8"
 ]
@@ -92,6 +93,7 @@ def parse_args():
     parser.add_argument("-tt", "--triton-toggles", action="store_true", help="If also perf without triton.")
     parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
     parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env only.")
+    parser.add_argument("-p", "--profiling", action="store_true", help="turn on perf profiling mode.")
 
     args = parser.parse_args()
 
@@ -187,6 +189,7 @@ def benchmark(
     triton=True,
     compile_mode="default",
     warmup=False,
+    profiling=False
 ):
 
     model_name = model
@@ -226,6 +229,8 @@ def benchmark(
                 model.model,
                 dtype=torch.qint8
             )
+            torch.save(model.model, f"{model.model_name}-int8.pt")
+
 
     model = YOLO(model)
     may_compile_and_quant(model)
@@ -268,6 +273,22 @@ def benchmark(
                 may_compile_and_quant(exported_model)
 
             emoji = "❎"  # indicates export succeeded
+
+            if profiling:
+                with torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA
+                        # torch.profiler.ProfilerActivity.MUSA
+                    ],
+                    record_shapes=True,
+                    profile_memory=True,
+                    with_stack=True,
+                    with_flops=True,
+                    with_modules=True,
+                ) as prof:
+                    exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
+                    exit(0)
 
             exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
 
@@ -336,7 +357,8 @@ def main(models: List[str],
          dataset: str = "coco128.yaml",
          imgsz: int = 640,
          device: str = DEFAULT_DEVICE,
-         dtypes: List[bool] = DEFAULT_DTYPES):
+         dtypes: List[bool] = DEFAULT_DTYPES,
+         profiling = False):
 
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
     os.makedirs(f"{CWD}/benchmarks/", exist_ok=True)
@@ -355,17 +377,19 @@ def main(models: List[str],
                     print("\n")
                     benchmark(
                         bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
-                        half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode
+                        half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode, profiling=profiling
                     )
             else:
                 print("\n")
                 benchmark(
                     bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
-                    half=half, int8=int8, dtype=dtype, device=device, triton=triton
+                    half=half, int8=int8, dtype=dtype, device=device, triton=triton,
+                    profiling=profiling
                 )
 
             time.sleep(1)
 
 
 if __name__ == "__main__":
-    main(args.models, args.batches, args.dataset, args.imgsz, args.device)
+    main(args.models, args.batches, args.dataset, args.imgsz, args.device,
+         profiling=args.profiling)
