@@ -21,18 +21,11 @@ import numpy as np
 
 
 model = YOLO('yolov8m.pt').to('cuda')  # 必须移到GPU
-print("INFO: using triton backend for model max-autotune")
 model.model.to('musa').eval()
-# model.model = torch.compile(model.model, backend="inductor", mode="max-autotune")
+print("INFO: compiling model ...")
+model.model = torch.compile(model.model, backend="inductor", mode="default")
 # 运行推理（注意：需通过原始YOLO接口调用）
-results = model.predict('images/bus.jpg')  # 可结合FP16
-
-model = YOLO('yolov8m.pt').to('cuda')  # 必须移到GPU
-print("INFO: using triton backend for model max-autotune")
-model.model.to('musa').eval()
-# model.model = torch.compile(model.model, backend="inductor", mode="max-autotune")
-# 运行推理（注意：需通过原始YOLO接口调用）
-for i in range(10):
+for i in range(9):
     results = model.predict('images/bus.jpg')  # 可结合FP16
 
 

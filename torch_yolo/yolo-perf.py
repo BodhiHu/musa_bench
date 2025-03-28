@@ -78,7 +78,6 @@ COMPILE_MODES = [
     "reduce-overhead",
     "max-autotune",
     "max-autotune-no-cudagraphs",
-    "default",
 ]
 CWD = os.path.dirname(os.path.abspath(__file__))
 
@@ -90,15 +89,22 @@ def parse_args():
     parser.add_argument("--dataset", default="coco128.yaml", help="Dataset configuration file (e.g., coco128.yaml).")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
+    parser.add_argument("--dtypes", default=DEFAULT_DTYPES, type=lambda s: s.split(","), help="dtypes (e.g. int8,fp16,fp32)")
+    parser.add_argument("--cmp-modes", default=COMPILE_MODES, type=lambda s: s.split(","), help="compile modes")
     parser.add_argument("-tt", "--triton-toggles", action="store_true", help="If also perf without triton.")
+    parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
     parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
-    parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env only.")
+    parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env.")
     parser.add_argument("-p", "--profiling", action="store_true", help="turn on perf profiling mode.")
 
     args = parser.parse_args()
 
+    global TRITON_TOGGLES
     if args.triton_toggles:
-        TRITON_TOGGLES.insert(0, False)
+        TRITON_TOGGLES.append(False)
+    if args.no_compile:
+        TRITON_TOGGLES = [False]
+
     return args
 
 args = parse_args()
@@ -134,7 +140,7 @@ if args.debug:
         # recompiles_verbose  = True,
         # trace_source        = True,
         # trace_call          = True,
-        # output_code         = True,
+        output_code         = True,
         # schedule            = True,
         # perf_hints          = True,
         # post_grad_graphs    = True,
@@ -189,7 +195,7 @@ def benchmark(
     triton=True,
     compile_mode="default",
     warmup=False,
-    profiling=False
+    profiling = False,
 ):
 
     model_name = model
@@ -225,11 +231,23 @@ def benchmark(
 
         if dtype == "int8":
             print(f"INFO: quantize model {type(model)} to {dtype}")
-            model.model = torch.quantization.quantize_dynamic(
-                model.model,
-                dtype=torch.qint8
-            )
+
+            # Dynamic quant:
+            # model.model = torch.quantization.quantize_dynamic(
+            #     model.model,
+            #     dtype=torch.qint8
+            # )
+
+            # Static quant:
+            model.model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
+            model_prepared = torch.quantization.prepare(model.model)
+            input_tensor = np.load('img_0.npy')
+            input_tensor = torch.from_numpy(input_tensor).to("cuda")
+            model_prepared(input_tensor)
+            model.model = torch.quantization.convert(model_prepared)
+
             torch.save(model.model, f"{model.model_name}-int8.pt")
+            # exit(0)
 
 
     model = YOLO(model)
@@ -253,7 +271,7 @@ def benchmark(
             if format_arg and format_arg != format:
                 continue
 
-            print(f"INFO: format = {format}, dtype = {dtype}")
+            print(f"INFO: format = {format}, dtype = {dtype}, half={half}, int8={int8}")
             if format == "-":
                 filename = model.pt_path or model.ckpt_path or model.model_name
                 exported_model = model  # PyTorch format
@@ -274,10 +292,16 @@ def benchmark(
 
             emoji = "❎"  # indicates export succeeded
 
+            exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
+
+            if warmup:
+                return
+
             if profiling:
+                print(f"INFO: start profiling")
                 with torch.profiler.profile(
                     activities=[
-                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CPU, 
                         torch.profiler.ProfilerActivity.CUDA
                         # torch.profiler.ProfilerActivity.MUSA
                     ],
@@ -288,11 +312,7 @@ def benchmark(
                     with_modules=True,
                 ) as prof:
                     exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
-                    exit(0)
-
-            exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
-
-            if warmup:
+                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
                 return
 
             # Validate
@@ -358,6 +378,7 @@ def main(models: List[str],
          imgsz: int = 640,
          device: str = DEFAULT_DEVICE,
          dtypes: List[bool] = DEFAULT_DTYPES,
+         cmp_modes = COMPILE_MODES,
          profiling = False):
 
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
@@ -371,25 +392,27 @@ def main(models: List[str],
                 print("INFO: torch compile warming up...")
                 benchmark(
                     bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
-                    half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode="default", warmup=True
+                    half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode="default",
+                    warmup=True
                 )
-                for compile_mode in COMPILE_MODES:
+                for compile_mode in cmp_modes:
                     print("\n")
                     benchmark(
                         bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
-                        half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode, profiling=profiling
+                        half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode,
+                        profiling=profiling
                     )
             else:
                 print("\n")
                 benchmark(
                     bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
                     half=half, int8=int8, dtype=dtype, device=device, triton=triton,
-                    profiling=profiling
                 )
 
             time.sleep(1)
 
 
 if __name__ == "__main__":
-    main(args.models, args.batches, args.dataset, args.imgsz, args.device,
-         profiling=args.profiling)
+    main(args.models, args.batches, args.dataset, args.imgsz, args.device, args.dtypes,
+         cmp_modes=args.cmp_modes, profiling=args.profiling
+        )
