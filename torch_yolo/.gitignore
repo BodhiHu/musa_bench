@@ -2,5 +2,6 @@ datasets/
 runs/
 benchmarks-*
 *.pt
+*.pth
 torch_compile_debug
 **/*.torchscript

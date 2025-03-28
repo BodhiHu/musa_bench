@@ -22,6 +22,7 @@ from itertools import product
 from typing import List
 from pathlib import Path
 from typing import Literal
+from torch.ao.quantization import quantize_fx, HistogramObserver, MinMaxObserver, QConfig
 
 try:
     import torch_musa.cuda_compat
@@ -90,6 +91,7 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
     parser.add_argument("--dtypes", default=DEFAULT_DTYPES, type=lambda s: s.split(","), help="dtypes (e.g. int8,fp16,fp32)")
+    parser.add_argument("--q-method", default="static", type=str, help="quant method (dynamic, static, fx)")
     parser.add_argument("--cmp-modes", default=COMPILE_MODES, type=lambda s: s.split(","), help="compile modes")
     parser.add_argument("-tt", "--triton-toggles", action="store_true", help="If also perf without triton.")
     parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
@@ -229,26 +231,76 @@ def benchmark(
             #     with torch.no_grad():
             #         model.model(input_tensor)
 
+        quant_method = args.q_method
         if dtype == "int8":
-            print(f"INFO: quantize model {type(model)} to {dtype}")
+            print(f"INFO: quantize model {type(model.model)} to {dtype} using {quant_method} method")
+
+            backend = "qnnpack"
+            input_tensor = np.load('img_0.npy')
+            input_tensor = torch.from_numpy(input_tensor)
 
             # Dynamic quant:
-            # model.model = torch.quantization.quantize_dynamic(
-            #     model.model,
-            #     dtype=torch.qint8
-            # )
+            if quant_method == "dynamic":
+                model.model = torch.quantization.quantize_dynamic(
+                    model.model,
+                    dtype=torch.qint8
+                )
 
             # Static quant:
-            model.model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
-            model_prepared = torch.quantization.prepare(model.model)
-            input_tensor = np.load('img_0.npy')
-            input_tensor = torch.from_numpy(input_tensor).to("cuda")
-            model_prepared(input_tensor)
-            model.model = torch.quantization.convert(model_prepared)
+            if quant_method == "static":
+                qcfg = QConfig(
+                    activation=HistogramObserver.with_args(reduce_range=False, dtype=torch.qint8),
+                    weight=MinMaxObserver.with_args(qscheme=torch.per_tensor_symmetric, dtype=torch.qint8)
+                )
+                # model.model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
+                model.model.qconfig = qcfg
+                model_prepared = torch.quantization.prepare(model.model)
+                input_tensor = np.load('img_0.npy')
+                input_tensor = torch.from_numpy(input_tensor)
+                model_prepared(input_tensor)
+                model.model = torch.quantization.convert(model_prepared)
+                for name, module in model.model.named_modules():
+                    print(f"{name:<24} :: {type(module)}")
+                    if isinstance(module, torch.nn.Conv2d):
+                        next_module = model.model._modules.get(name.split('.')[0] + '.' + str(int(name.split('.')[1])+1))
+                        assert isinstance(next_module, torch.nn.BatchNorm2d), f"BatchNorm2d should follow right behind Conv2d"
+                        print(f"  => Fusing {name} and {next_module}")
+                        torch.quantization.fuse_modules(
+                            model.model,
+                            [
+                                name.split('.')[0] + '.' + name.split('.')[1],
+                                name.split('.')[0] + '.' + str(int(name.split('.')[1])+1)
+                            ],
+                            inplace=True
+                        )
 
-            torch.save(model.model, f"{model.model_name}-int8.pt")
-            # exit(0)
+                # TorchMusa does not support conv2d
+                torch.ao.quantization.fuse_modules(model.model, [["conv", "bn"]], inplace=True)
 
+            # FX Graph Mode Quant:
+            if quant_method == "fx":
+                qcfg = QConfig(
+                    activation=HistogramObserver.with_args(reduce_range=False, dtype=torch.qint8),
+                    weight=MinMaxObserver.with_args(qscheme=torch.per_tensor_symmetric, dtype=torch.qint8)
+                )
+                qconfig_dict = {
+                    # "": torch.ao.quantization.get_default_qconfig(backend),  # Apply to all ops
+                    # "": qcfg,
+                    torch.nn.Conv2d:    qcfg,
+                    torch.nn.MaxPool2d: qcfg,
+                    torch.mul:          qcfg,
+                    torch.add:          qcfg,
+                    torch.nn.Sigmoid:   qcfg,
+                    torch.split:        qcfg
+                }
+                model_prepared = quantize_fx.prepare_fx(model.model, qconfig_dict, (input_tensor))
+                model_prepared(input_tensor)
+                model_quantized = quantize_fx.convert_fx(model_prepared)
+                model.model = model_quantized
+
+            quanzied_model_file = f"{model.model_name}-{dtype}.pth"
+            torch.save(model.model, quanzied_model_file)
+            print(f"INFO: {dtype} quantized model saved to {quanzied_model_file}")
 
     model = YOLO(model)
     may_compile_and_quant(model)
@@ -292,7 +344,10 @@ def benchmark(
 
             emoji = "❎"  # indicates export succeeded
 
-            exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
+            exported_model.predict(
+                ASSETS / "bus.jpg",
+                imgsz=imgsz, device=device, half=half, int8=int8, verbose=False
+            )
 
             if warmup:
                 return
@@ -311,7 +366,10 @@ def benchmark(
                     with_flops=True,
                     with_modules=True,
                 ) as prof:
-                    exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
+                    exported_model.predict(
+                        ASSETS / "bus.jpg",
+                        imgsz=imgsz, device=device, half=half, int8=int8, verbose=False
+                    )
                 print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
                 return
 
