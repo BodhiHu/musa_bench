@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import traceback
 import numpy as np
 import logging
@@ -91,7 +92,7 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
     parser.add_argument("--dtypes", default=DEFAULT_DTYPES, type=lambda s: s.split(","), help="dtypes (e.g. int8,fp16,fp32)")
-    parser.add_argument("--q-method", default="static", type=str, help="quant method (dynamic, static, fx)")
+    parser.add_argument("--qmethod", default="static", type=str, help="quant method (dynamic, static, fx, neuro-static)")
     parser.add_argument("--cmp-modes", default=COMPILE_MODES, type=lambda s: s.split(","), help="compile modes")
     parser.add_argument("-tt", "--triton-toggles", action="store_true", help="If also perf without triton.")
     parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
@@ -231,9 +232,10 @@ def benchmark(
             #     with torch.no_grad():
             #         model.model(input_tensor)
 
-        quant_method = args.q_method
+        quant_method = args.qmethod
         if dtype == "int8":
             print(f"INFO: quantize model {type(model.model)} to {dtype} using {quant_method} method")
+            model.model.to("cpu").eval()
 
             backend = "qnnpack"
             input_tensor = np.load('img_0.npy')
@@ -248,34 +250,55 @@ def benchmark(
 
             # Static quant:
             if quant_method == "static":
+                Conv2d      = torch.nn.modules.conv.Conv2d
+                BatchNorm2d = torch.nn.modules.batchnorm.BatchNorm2d
+
+                # Quant to int8
                 qcfg = QConfig(
                     activation=HistogramObserver.with_args(reduce_range=False, dtype=torch.qint8),
                     weight=MinMaxObserver.with_args(qscheme=torch.per_tensor_symmetric, dtype=torch.qint8)
                 )
+                quant_list = [
+                    torch.nn.modules.conv.Conv2d,
+                    torch.nn.MaxPool2d,
+                    torch.mul,
+                    torch.add,
+                    torch.nn.Sigmoid,
+                    torch.split
+                ]
+
+                print_ops = False
+                fuse_ops = False
+                matched_conv2d_name = None
+                matched_bn2d_name = None
+                for name, module in model.model.named_modules():
+                    module.qconfig = None
+                    if print_ops:
+                        print(f"{name:<24} :: {type(module)}")
+                    if fuse_ops:
+                        if re.search("activation.*", str(type(module)), re.IGNORECASE):
+                            print("  => will not quantize")
+                            matched_conv2d_name, matched_bn2d_name = None, None
+                            continue
+
+                        if matched_conv2d_name:
+                            if isinstance(module, BatchNorm2d):
+                                assert matched_bn2d_name == name
+                                # fuse conv2d and bn2d
+                                print(f"  => Fusing {matched_conv2d_name} and {matched_bn2d_name}")
+                                torch.quantization.fuse_modules(
+                                    model.model,
+                                    [ matched_conv2d_name, matched_bn2d_name ],
+                                    inplace=True
+                                )
+                        matched_conv2d_name, matched_bn2d_name = None, None
+
                 # model.model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
                 model.model.qconfig = qcfg
-                model_prepared = torch.quantization.prepare(model.model)
-                input_tensor = np.load('img_0.npy')
-                input_tensor = torch.from_numpy(input_tensor)
+                # model.model.qconfig_dict = qconfig_dict
+                model_prepared = torch.quantization.prepare(model.model, allow_list=quant_list)
                 model_prepared(input_tensor)
                 model.model = torch.quantization.convert(model_prepared)
-                for name, module in model.model.named_modules():
-                    print(f"{name:<24} :: {type(module)}")
-                    if isinstance(module, torch.nn.Conv2d):
-                        next_module = model.model._modules.get(name.split('.')[0] + '.' + str(int(name.split('.')[1])+1))
-                        assert isinstance(next_module, torch.nn.BatchNorm2d), f"BatchNorm2d should follow right behind Conv2d"
-                        print(f"  => Fusing {name} and {next_module}")
-                        torch.quantization.fuse_modules(
-                            model.model,
-                            [
-                                name.split('.')[0] + '.' + name.split('.')[1],
-                                name.split('.')[0] + '.' + str(int(name.split('.')[1])+1)
-                            ],
-                            inplace=True
-                        )
-
-                # TorchMusa does not support conv2d
-                torch.ao.quantization.fuse_modules(model.model, [["conv", "bn"]], inplace=True)
 
             # FX Graph Mode Quant:
             if quant_method == "fx":
@@ -298,9 +321,29 @@ def benchmark(
                 model_quantized = quantize_fx.convert_fx(model_prepared)
                 model.model = model_quantized
 
-            quanzied_model_file = f"{model.model_name}-{dtype}.pth"
+            if quant_method == "neuro-static":
+                from neurotrim.compression.config import Config
+                from neurotrim.compression.builder import build_compressor
+
+                config = Config("./yolo-static-quant-config.json")
+                config.device = "cpu"
+                compressor = build_compressor(model.model, config, trace=False)
+                # TODO: load calib dataset
+                dataloader = None
+                def calib_func(model, dataloader):
+                    for img, label in dataloader:
+                        out = model(img)
+
+                quant_model = compressor.compress(
+                    calib_data=dataloader,
+                    calib_func=calib_func if dataloader else None
+                )
+                model.model = quant_model
+
+            quanzied_model_file = f"{model.model_name.replace('.pt', '')}-{dtype}-{quant_method}.pth"
             torch.save(model.model, quanzied_model_file)
-            print(f"INFO: {dtype} quantized model saved to {quanzied_model_file}")
+            print(f"INFO: quantized model({type(model.model)}) saved to {quanzied_model_file}")
+            model.model.to(device).eval()
 
     model = YOLO(model)
     may_compile_and_quant(model)
