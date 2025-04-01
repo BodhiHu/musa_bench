@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import copy
 import os
 import re
 import traceback
@@ -267,14 +268,18 @@ def benchmark(
                     torch.split
                 ]
 
-                print_ops = False
+                print_mod = False
                 fuse_ops = False
                 matched_conv2d_name = None
                 matched_bn2d_name = None
+
+                if print_mod:
+                    print(model.model)
                 for name, module in model.model.named_modules():
-                    module.qconfig = None
-                    if print_ops:
+                    if print_mod:
                         print(f"{name:<24} :: {type(module)}")
+                    if type(module) in quant_list:
+                        module.qconfig = qcfg
                     if fuse_ops:
                         if re.search("activation.*", str(type(module)), re.IGNORECASE):
                             print("  => will not quantize")
@@ -296,9 +301,9 @@ def benchmark(
                 # model.model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
                 model.model.qconfig = qcfg
                 # model.model.qconfig_dict = qconfig_dict
-                model_prepared = torch.quantization.prepare(model.model, allow_list=quant_list)
+                model_prepared = torch.quantization.prepare(model.model, allow_list=copy.deepcopy(quant_list))
                 model_prepared(input_tensor)
-                model.model = torch.quantization.convert(model_prepared)
+                model.model = torch.quantization.convert(model_prepared, allow_list=copy.deepcopy(quant_list))
 
             # FX Graph Mode Quant:
             if quant_method == "fx":
@@ -341,8 +346,10 @@ def benchmark(
                 model.model = quant_model
 
             quanzied_model_file = f"{model.model_name.replace('.pt', '')}-{dtype}-{quant_method}.pth"
+            if os.path.exists(quanzied_model_file):
+                os.remove(quanzied_model_file)
             torch.save(model.model, quanzied_model_file)
-            print(f"INFO: quantized model({type(model.model)}) saved to {quanzied_model_file}")
+            print(f"INFO: saved quantized model({type(model.model)}) to {quanzied_model_file}")
             model.model.to(device).eval()
 
     model = YOLO(model)
@@ -371,7 +378,7 @@ def benchmark(
                 filename = model.pt_path or model.ckpt_path or model.model_name
                 exported_model = model  # PyTorch format
             elif format == 'torchscript':
-                print(f"INFO: dtype={dtype}, export model to torchscript")
+                print(f"INFO: export model to torchscript")
                 filename = model.export(
                     imgsz=imgsz, format="torchscript",
                     batch=batch, optimize=True,
