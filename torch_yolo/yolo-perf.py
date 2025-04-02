@@ -265,10 +265,11 @@ def benchmark(
                     torch.mul,
                     torch.add,
                     torch.nn.Sigmoid,
-                    torch.split
+                    torch.split,
                 ]
 
                 print_mod = False
+                print_layers = False
                 fuse_ops = False
                 matched_conv2d_name = None
                 matched_bn2d_name = None
@@ -276,26 +277,29 @@ def benchmark(
                 if print_mod:
                     print(model.model)
                 for name, module in model.model.named_modules():
-                    if print_mod:
+                    if print_layers:
                         print(f"{name:<24} :: {type(module)}")
                     if type(module) in quant_list:
                         module.qconfig = qcfg
                     if fuse_ops:
-                        if re.search("activation.*", str(type(module)), re.IGNORECASE):
-                            print("  => will not quantize")
-                            matched_conv2d_name, matched_bn2d_name = None, None
-                            continue
+                        # if re.search("activation.*", str(type(module)), re.IGNORECASE):
+                        #     print("  => will not quantize")
+                        #     matched_conv2d_name, matched_bn2d_name = None, None
+                        #     continue
 
-                        if matched_conv2d_name:
-                            if isinstance(module, BatchNorm2d):
-                                assert matched_bn2d_name == name
-                                # fuse conv2d and bn2d
-                                print(f"  => Fusing {matched_conv2d_name} and {matched_bn2d_name}")
-                                torch.quantization.fuse_modules(
-                                    model.model,
-                                    [ matched_conv2d_name, matched_bn2d_name ],
-                                    inplace=True
-                                )
+                        if isinstance(module, Conv2d):
+                            matched_conv2d_name = name
+                            continue
+                        if isinstance(module, BatchNorm2d):
+                            matched_bn2d_name = name
+                            assert matched_conv2d_name is not None and matched_bn2d_name is not None
+                            # fuse conv2d and bn2d
+                            print(f"  => Fusing {matched_conv2d_name} and {matched_bn2d_name}")
+                            torch.quantization.fuse_modules(
+                                model.model,
+                                [ matched_conv2d_name, matched_bn2d_name ],
+                                inplace=True
+                            )
                         matched_conv2d_name, matched_bn2d_name = None, None
 
                 # model.model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
@@ -344,6 +348,15 @@ def benchmark(
                     calib_func=calib_func if dataloader else None
                 )
                 model.model = quant_model
+
+            if print_layers:
+                print("")
+                print("=============================================================================")
+                print("Model after quantization:")
+                for name, module in model.model.named_modules():
+                    print(f"{name:<24} :: {type(module)}")
+                print("=============================================================================")
+                print("")
 
             quanzied_model_file = f"{model.model_name.replace('.pt', '')}-{dtype}-{quant_method}.pth"
             if os.path.exists(quanzied_model_file):
