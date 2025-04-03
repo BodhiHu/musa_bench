@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import copy
+from functools import partial
 import os
 import re
 import traceback
@@ -93,7 +94,7 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
     parser.add_argument("--dtypes", default=DEFAULT_DTYPES, type=lambda s: s.split(","), help="dtypes (e.g. int8,fp16,fp32)")
-    parser.add_argument("--qmethod", default="static", type=str, help="quant method (dynamic, static, fx, neuro-static)")
+    parser.add_argument("--qmethod", default="static", type=str, help="quant method (dynamic, static, fx, neuro-fx)")
     parser.add_argument("--cmp-modes", default=COMPILE_MODES, type=lambda s: s.split(","), help="compile modes")
     parser.add_argument("-tt", "--triton-toggles", action="store_true", help="If also perf without triton.")
     parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
@@ -332,24 +333,144 @@ def benchmark(
                 model_quantized = quantize_fx.convert_fx(model_prepared)
                 model.model = model_quantized
 
-            if quant_method == "neuro-static":
+            if quant_method == "neuro-fx":
+                from torch import fx
                 from neurotrim.compression.config import Config
                 from neurotrim.compression.builder import build_compressor
+                from neurotrim.graph.graph_optimizer import GraphOptimizer
+                from utils.dataloaders import create_dataloader
+                from utils.general import colorstr
 
-                config = Config("./yolo-static-quant-config.json")
-                config.device = "cpu"
-                compressor = build_compressor(model.model, config, trace=False)
-                # TODO: load calib dataset
-                dataloader = None
-                def calib_func(model, dataloader):
-                    for img, label in dataloader:
-                        out = model(img)
+                class CustomedTracer(fx.Tracer):
+                    """
+                    ``Tracer`` is the class that implements the symbolic tracing functionality
+                    of ``torch.fx.symbolic_trace``. A call to ``symbolic_trace(m)`` is equivalent
+                    to ``Tracer().trace(m)``.
+                    This Tracer override the ``is_leaf_module`` function to make symbolic trace
+                    right in some cases.
+                    """
 
-                quant_model = compressor.compress(
-                    calib_data=dataloader,
-                    calib_func=calib_func if dataloader else None
+                    def __init__(self, *args, customed_leaf_module=None, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self.customed_leaf_module = customed_leaf_module
+
+                    def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str) -> bool:
+                        """
+                        A method to specify whether a given ``nn.Module`` is a "leaf" module.
+                        Leaf modules are the atomic units that appear in
+                        the IR, referenced by ``call_module`` calls. By default,
+                        Modules in the PyTorch standard library namespace (torch.nn)
+                        are leaf modules. All other modules are traced through and
+                        their constituent ops are recorded, unless specified otherwise
+                        via this parameter.
+                        Args:
+                            m (Module): The module being queried about
+                            module_qualified_name (str): The path to root of this module. For example,
+                                if you have a module hierarchy where submodule ``foo`` contains
+                                submodule ``bar``, which contains submodule ``baz``, that module will
+                                appear with the qualified name ``foo.bar.baz`` here.
+                        """
+                        if self.customed_leaf_module and isinstance(m, self.customed_leaf_module):
+                            return True
+
+                        if hasattr(m, "_is_leaf_module") and m._is_leaf_module:
+                            return True
+
+                        return m.__module__.startswith("torch.nn") and not isinstance(
+                            m, torch.nn.Sequential
+                        )
+
+                def calibrate(model, dataloader, steps=30):
+                    for batch_i, (imgs, _, _, _) in tqdm(enumerate(dataloader)):
+                        imgs = imgs.float()
+                        imgs /= 255  # 0 - 255 to 0.0 - 1.0
+
+                        # Inference
+                        _, _ = model(imgs)  # inference, loss outputs
+                        if batch_i >= steps:
+                            return
+
+                def _getattr(model, name):
+                    """customize getattr function to recursive get attribute for pytorch module"""
+                    name_list = name.split(".")
+                    for name in name_list:  # pylint: disable=redefined-argument-from-local
+                        model = getattr(model, name)
+                    return model
+
+                def postprocess(model: fx.GraphModule):
+                    """replace float add to quantized one, reduce dequantize ops"""
+                    for node in model.graph.nodes:
+                        if node.op != "call_module":
+                            continue
+                        if not isinstance(_getattr(model, node.target), torch.nn.Upsample):
+                            continue
+                        args = node.args
+                        assert len(args) == 1
+                        up_arg = args[0]
+                        if up_arg.target == "dequantize":
+                            quant_arg = up_arg.args[0]
+                        else:
+                            continue
+                        assert len(node.users) == 1
+                        cat_node = list(node.users.keys())[0]
+                        assert cat_node.target == torch.cat
+                        cat_inputs = cat_node.args[0]
+                        flag = True
+                        for cat_inp in cat_inputs:
+                            if cat_inp is node:
+                                continue
+                            if cat_inp.target == "dequantize":
+                                cat_quant = cat_inp.args[0]
+                                cat_inp.replace_all_uses_with(cat_quant)
+                                model.graph.erase_node(cat_inp)
+                            else:
+                                flag = False
+                        if flag and len(cat_node.users) == 1:
+                            up_arg.replace_all_uses_with(quant_arg)
+                            model.graph.erase_node(up_arg)
+                            late_node = list(cat_node.users.keys())[0]
+                            assert late_node.target == torch.quantize_per_tensor
+                            late_node.replace_all_uses_with(cat_node)
+                            model.graph.erase_node(late_node)
+
+                    model.graph.lint()
+                    model.recompile()
+
+
+                model.model.to("cpu").eval()
+                task = "val"  # path to train/val/test images
+                stride = model.stride
+                single_cls=False
+                pad = 0.5
+                rect = model.pt
+                workers = 8
+                dataloader = create_dataloader(
+                    data[task],
+                    imgsz,
+                    batch,
+                    stride,
+                    single_cls,
+                    pad=pad,
+                    rect=rect,
+                    workers=workers,
+                    prefix=colorstr(f"{task}: "),
+                )[0]
+
+                nhwc = False
+                if nhwc:
+                    model = model.to(memory_format=torch.channels_last)
+
+                config = Config("yolov8-neuro-fx-quant-config.json")
+                config.device = device.type
+                compressor = build_compressor(model.model, config, trace=CustomedTracer())
+                compressor.compress(
+                    calib_data=dataloader, calib_func=partial(calibrate, steps=30)
                 )
-                model.model = quant_model
+                graph_opt = GraphOptimizer(compressor)
+                qmodel = graph_opt.optimize()
+                qmodel.names = model.model.names
+                postprocess(qmodel)
+                model.model = qmodel
 
             if print_layers:
                 print("")
