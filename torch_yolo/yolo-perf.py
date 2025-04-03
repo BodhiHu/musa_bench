@@ -219,8 +219,7 @@ def benchmark(
                 print(f"WARN: will not call compile for model.model of type = {type(model.model)}")
                 return
 
-            if not warmup:
-                print(f"INFO: compile model {type(model.model)} on {device}, mode = {compile_mode}")
+            print(f"INFO: compile model {type(model.model)} on {device}, mode = {compile_mode}")
             model.model.to(device).eval()
             model.model = torch.compile(
                 model.model,
@@ -241,6 +240,7 @@ def benchmark(
             backend = "qnnpack"
             input_tensor = np.load('img_0.npy')
             input_tensor = torch.from_numpy(input_tensor)
+            full_quant = True
 
             # Dynamic quant:
             if quant_method == "dynamic":
@@ -267,6 +267,8 @@ def benchmark(
                     torch.nn.Sigmoid,
                     torch.split,
                 ]
+                if full_quant:
+                    quant_list = None
 
                 print_mod = False
                 print_layers = False
@@ -279,7 +281,7 @@ def benchmark(
                 for name, module in model.model.named_modules():
                     if print_layers:
                         print(f"{name:<24} :: {type(module)}")
-                    if type(module) in quant_list:
+                    if quant_list is None or type(module) in quant_list:
                         module.qconfig = qcfg
                     if fuse_ops:
                         # if re.search("activation.*", str(type(module)), re.IGNORECASE):
@@ -305,9 +307,9 @@ def benchmark(
                 # model.model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
                 model.model.qconfig = qcfg
                 # model.model.qconfig_dict = qconfig_dict
-                model_prepared = torch.quantization.prepare(model.model, allow_list=copy.deepcopy(quant_list))
+                model_prepared = torch.quantization.prepare(model.model, allow_list=quant_list)
                 model_prepared(input_tensor)
-                model.model = torch.quantization.convert(model_prepared, allow_list=copy.deepcopy(quant_list))
+                model.model = torch.quantization.convert(model_prepared, allow_list=quant_list)
 
             # FX Graph Mode Quant:
             if quant_method == "fx":
@@ -407,12 +409,14 @@ def benchmark(
 
             emoji = "❎"  # indicates export succeeded
 
-            exported_model.predict(
-                ASSETS / "bus.jpg",
-                imgsz=imgsz, device=device, half=half, int8=int8, verbose=False
-            )
-
             if warmup:
+                print("INFO: warming up model ...")
+                for _half in (True, False):
+                    for _ in range(3):
+                        exported_model.predict(
+                            ASSETS / "bus.jpg",
+                            imgsz=imgsz, device=device, half=_half, int8=int8, verbose=False
+                        )
                 return
 
             if profiling:
@@ -435,6 +439,11 @@ def benchmark(
                     )
                 print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
                 return
+            else:
+                exported_model.predict(
+                    ASSETS / "bus.jpg",
+                    imgsz=imgsz, device=device, half=half, int8=int8, verbose=False
+                )
 
             # Validate
             results = exported_model.val(
