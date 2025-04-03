@@ -1,0 +1,36 @@
+{
+    "framework": "pytorch",
+    "device": "musa",
+
+    "quantize": {
+        "algo": "static-quantizer",
+        "quant_types": [
+            "activation", "weight"
+        ],
+        "op_types": [
+            "conv", "linear", "lstm"
+        ],
+        "observers": {
+            "weight": {
+                "quant_per_channel": false,
+                "quant_symmetric": true,
+                "type": "minmax"
+            },
+            "activation": {
+                "quant_per_channel": false,
+                "quant_symmetric": false,
+                "type": "histogram"
+            }
+        },
+        "op_names": [],
+        "exclude": [],
+        "quant_bits": 8,
+        "fold_bn": false,
+        "quant_start_step": 0
+    },
+
+    "export": {
+        "export_dir": "./exported",
+        "target": "pt"
+    }
+}

@@ -1,3 +1,5 @@
 bench_dp4a
 **/*.log
 logs/
+__pycache__
+

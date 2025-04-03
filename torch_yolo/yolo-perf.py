@@ -4,12 +4,14 @@ import copy
 from functools import partial
 import os
 import re
+import sys
 import traceback
 import numpy as np
 import logging
 import platform
 import torch
 import torch_musa
+from tqdm import tqdm
 from datetime import datetime
 from ultralytics import YOLO
 from ultralytics.cfg import TASK2DATA, TASK2METRIC
@@ -36,6 +38,13 @@ except Exception as exc:
     del torch.cuda
     torch.cuda = torch.musa
 
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(current_dir)
+sys.path.append(os.path.abspath(f"{current_dir}/.."))
+sys.path.append(os.path.abspath(f"{current_dir}/../.."))
+print(current_dir)
+print(sys.path)
 
 # torch._dynamo.config.cache_size_limit = 128
 
@@ -94,7 +103,7 @@ def parse_args():
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
     parser.add_argument("--dtypes", default=DEFAULT_DTYPES, type=lambda s: s.split(","), help="dtypes (e.g. int8,fp16,fp32)")
-    parser.add_argument("--qmethod", default="static", type=str, help="quant method (dynamic, static, fx, neuro-fx)")
+    parser.add_argument("--qmethod", default="neuro-fx", type=str, help="quant method (dynamic, static, fx, neuro-fx)")
     parser.add_argument("--cmp-modes", default=COMPILE_MODES, type=lambda s: s.split(","), help="compile modes")
     parser.add_argument("-tt", "--triton-toggles", action="store_true", help="If also perf without triton.")
     parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
@@ -338,8 +347,8 @@ def benchmark(
                 from neurotrim.compression.config import Config
                 from neurotrim.compression.builder import build_compressor
                 from neurotrim.graph.graph_optimizer import GraphOptimizer
-                from utils.dataloaders import create_dataloader
-                from utils.general import colorstr
+                from musa_bench.utils.dataloaders import create_dataloader
+                from musa_bench.utils.general import colorstr
 
                 class CustomedTracer(fx.Tracer):
                     """
@@ -436,13 +445,15 @@ def benchmark(
                     model.graph.lint()
                     model.recompile()
 
-
-                model.model.to("cpu").eval()
+                # print(f"{type(model.model)}:\n", model.model)
+                # exit(0)
+                _model = model.model
+                _model.to("cpu").eval()
                 task = "val"  # path to train/val/test images
-                stride = model.stride
+                stride = _model.stride
                 single_cls=False
                 pad = 0.5
-                rect = model.pt
+                rect = _model.pt
                 workers = 8
                 dataloader = create_dataloader(
                     data[task],
@@ -458,17 +469,17 @@ def benchmark(
 
                 nhwc = False
                 if nhwc:
-                    model = model.to(memory_format=torch.channels_last)
+                    _model = _model.to(memory_format=torch.channels_last)
 
-                config = Config("yolov8-neuro-fx-quant-config.json")
+                config = Config("static_quant_config.json")
                 config.device = device.type
-                compressor = build_compressor(model.model, config, trace=CustomedTracer())
+                compressor = build_compressor(_model, config, trace=CustomedTracer())
                 compressor.compress(
                     calib_data=dataloader, calib_func=partial(calibrate, steps=30)
                 )
                 graph_opt = GraphOptimizer(compressor)
                 qmodel = graph_opt.optimize()
-                qmodel.names = model.model.names
+                qmodel.names = _model.names
                 postprocess(qmodel)
                 model.model = qmodel
 
