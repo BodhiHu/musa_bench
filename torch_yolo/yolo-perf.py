@@ -43,8 +43,6 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(current_dir)
 sys.path.append(os.path.abspath(f"{current_dir}/.."))
 sys.path.append(os.path.abspath(f"{current_dir}/../.."))
-print(current_dir)
-print(sys.path)
 
 # torch._dynamo.config.cache_size_limit = 128
 
@@ -348,7 +346,7 @@ def benchmark(
                 from neurotrim.compression.builder import build_compressor
                 from neurotrim.graph.graph_optimizer import GraphOptimizer
                 from musa_bench.utils.dataloaders import create_dataloader
-                from musa_bench.utils.general import colorstr
+                from musa_bench.utils.general import colorstr, yaml_load
 
                 class CustomedTracer(fx.Tracer):
                     """
@@ -445,18 +443,27 @@ def benchmark(
                     model.graph.lint()
                     model.recompile()
 
-                # print(f"{type(model.model)}:\n", model.model)
-                # exit(0)
                 _model = model.model
                 _model.to("cpu").eval()
                 task = "val"  # path to train/val/test images
-                stride = _model.stride
+                stride = max(int(_model.stride.max()), 32)
                 single_cls=False
                 pad = 0.5
-                rect = _model.pt
+                rect = True
                 workers = 8
+                calib_data = yaml_load(f"cfg/datasets/coco128.yaml")
+                print(
+                    ">>>>>",
+                    "\n  d " , calib_data[task],
+                    "\n  t " , task,
+                    "\n  s " , stride,
+                    "\n  s " , single_cls,
+                    "\n  p " , pad,
+                    "\n  r " , rect,
+                    "\n  w " , workers
+                )
                 dataloader = create_dataloader(
-                    data[task],
+                    calib_data[task],
                     imgsz,
                     batch,
                     stride,
