@@ -452,18 +452,8 @@ def benchmark(
                 rect = True
                 workers = 8
                 calib_data = yaml_load(f"cfg/datasets/coco128.yaml")
-                print(
-                    ">>>>>",
-                    "\n  d " , calib_data[task],
-                    "\n  t " , task,
-                    "\n  s " , stride,
-                    "\n  s " , single_cls,
-                    "\n  p " , pad,
-                    "\n  r " , rect,
-                    "\n  w " , workers
-                )
                 dataloader = create_dataloader(
-                    calib_data[task],
+                    "datasets/coco128/" + calib_data[task],
                     imgsz,
                     batch,
                     stride,
