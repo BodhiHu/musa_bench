@@ -96,7 +96,7 @@ CWD = os.path.dirname(os.path.abspath(__file__))
 def parse_args():
     parser = argparse.ArgumentParser(description="Run YOLO benchmarks.")
     parser.add_argument("--models", nargs="+", default=DEFAULT_MODELS, help="List of models to benchmark.")
-    parser.add_argument("--batches", nargs="+", type=int, default=DEFAULT_BATCHES, help="List of batch to test.")
+    parser.add_argument("--batches", type=lambda s: list(map(int, s.split(","))), default=DEFAULT_BATCHES, help="List of batch to test.")
     parser.add_argument("--dataset", default="coco128.yaml", help="Dataset configuration file (e.g., coco128.yaml).")
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device to run on.")
@@ -107,6 +107,7 @@ def parse_args():
     parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
     parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
     parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env.")
+    parser.add_argument("-g", "--use-graph", action="store_true", help="turn on cuda/musa graph.")
     parser.add_argument("-p", "--profiling", action="store_true", help="turn on perf profiling mode.")
 
     args = parser.parse_args()
@@ -207,6 +208,7 @@ def benchmark(
     triton=True,
     compile_mode="default",
     warmup=False,
+    use_graph=False,
     profiling = False,
 ):
 
@@ -571,7 +573,8 @@ def benchmark(
             else:
                 exported_model.predict(
                     ASSETS / "bus.jpg",
-                    imgsz=imgsz, device=device, half=half, int8=int8, verbose=False
+                    imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
+                    use_graph=use_graph
                 )
 
             # Validate
@@ -638,7 +641,8 @@ def main(models: List[str],
          device: str = DEFAULT_DEVICE,
          dtypes: List[bool] = DEFAULT_DTYPES,
          cmp_modes = COMPILE_MODES,
-         profiling = False):
+         profiling = False,
+         use_graph = False):
 
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
     os.makedirs(f"{CWD}/benchmarks/", exist_ok=True)
@@ -652,20 +656,21 @@ def main(models: List[str],
                 benchmark(
                     bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
                     half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode="default",
-                    warmup=True
+                    warmup=True, use_graph=use_graph
                 )
                 for compile_mode in cmp_modes:
                     print("\n")
                     benchmark(
                         bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
                         half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode,
-                        profiling=profiling
+                        profiling=profiling, use_graph=use_graph
                     )
             else:
                 print("\n")
                 benchmark(
                     bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
                     half=half, int8=int8, dtype=dtype, device=device, triton=triton,
+                    use_graph=use_graph
                 )
 
             time.sleep(1)
@@ -673,5 +678,7 @@ def main(models: List[str],
 
 if __name__ == "__main__":
     main(args.models, args.batches, args.dataset, args.imgsz, args.device, args.dtypes,
-         cmp_modes=args.cmp_modes, profiling=args.profiling
-        )
+         cmp_modes=args.cmp_modes,
+         profiling=args.profiling,
+         use_graph=args.use_graph
+         )

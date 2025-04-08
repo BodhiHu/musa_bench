@@ -1,4 +1,5 @@
 import torch
+import torch_musa
 import triton
 import triton.language as tl
 
