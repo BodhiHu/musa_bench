@@ -37,6 +37,7 @@ except Exception as exc:
     # fallback to manual cuda compat
     del torch.cuda
     torch.cuda = torch.musa
+    torch.cuda.CUDAGraph = torch.musa.MUSAGraph
 
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -82,6 +83,7 @@ DEFAULT_DTYPES = [
     # "int8"
 ]
 TRITON_TOGGLES = [True]
+GRAPH_TOGGLES = [False, True]
 DEFAULT_DEVICE = "cuda:0"
 # DEFAULT_DEVICE = "musa:0"
 COMPILE_MODES = [
@@ -117,6 +119,10 @@ def parse_args():
         TRITON_TOGGLES.append(False)
     if args.no_compile:
         TRITON_TOGGLES = [False]
+    
+    global GRAPH_TOGGLES
+    if args.use_graph:
+        GRAPH_TOGGLES = [True]
 
     return args
 
@@ -124,13 +130,6 @@ args = parse_args()
 
 
 if args.debug:
-    # logging.basicConfig(
-    #     level=logging.DEBUG, 
-    #     # format="%(asctime)s - %(levelname)s - %(message)s",
-    # )
-    # # Ensure the root logger captures debug messages
-    # logger = logging.getLogger()
-    # logger.setLevel(logging.DEBUG)
     torch._logging.set_logs(
         # all                 = logging.DEBUG,
         # dynamo              = logging.DEBUG,
@@ -519,7 +518,7 @@ def benchmark(
             if format_arg and format_arg != format:
                 continue
 
-            print(f"INFO: format = {format}, dtype = {dtype}, half={half}, int8={int8}")
+            print(f"INFO: format = {format}, use_graph = {use_graph}, batch = {batch}, triton = {compile_mode if triton else triton}, dtype = {dtype}, half={half}, int8={int8}")
             if format == "-":
                 filename = model.pt_path or model.ckpt_path or model.model_name
                 exported_model = model  # PyTorch format
@@ -546,7 +545,8 @@ def benchmark(
                     for _ in range(3):
                         exported_model.predict(
                             ASSETS / "bus.jpg",
-                            imgsz=imgsz, device=device, half=_half, int8=int8, verbose=False
+                            imgsz=imgsz, device=device, half=_half, int8=int8, verbose=False,
+                            use_graph=use_graph
                         )
                 return
 
@@ -566,7 +566,8 @@ def benchmark(
                 ) as prof:
                     exported_model.predict(
                         ASSETS / "bus.jpg",
-                        imgsz=imgsz, device=device, half=half, int8=int8, verbose=False
+                        imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
+                        use_graph=use_graph
                     )
                 print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
                 return
@@ -598,7 +599,7 @@ def benchmark(
     dt = time.time() - t0
 
     row = y[0]
-    print_table_row(bf, model_name, row[2], dtype, batch, data, imgsz, triton, compile_mode, row[3], row[4], row[5])
+    print_table_row(bf, model_name, row[2], use_graph, dtype, batch, data, imgsz, triton, compile_mode, row[3], row[4], row[5])
 
     legend = "Benchmarks legend:  - ✅ Success  - ❎ Export passed but validation failed  - ❌️ Export failed"
     s = f"\nBenchmarks complete for {name} on {data} at imgsz={imgsz} ({dt:.2f}s)\n{legend}\n{df.fillna('-')}\n"
@@ -622,15 +623,13 @@ tr:nth-child(even) { background-color: rgba(99,99,99,0.3); }
 </style>
 
 """)
-    bf.write(f"| Model            | Size             | dtype            | batch            | dataset          | imgsz            | compile(triton)  | mAP50-95(B)      | ms/im            | FPS              |\n")
-    bf.write(f"| :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: |\n")
+    bf.write(f"| Model       | Size      | graph    | dtype    | batch   | dataset          | imgsz            | compile(triton)  | mAP50-95(B)      | ms/im            | FPS              |\n")
+    bf.write(f"| :---------: | :-------: | :------: | :------: | :-----: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: | :--------------: |\n")
     bf.flush()
 
-def print_table_row(bf, model, size, dtype, batch, dataset, imgsz, triton, compile_mode, metrics_mAP50, ms_per_img, fps):
-    if triton:
-        bf.write(f"| {model:<17}| {size:<17}| {dtype:<17}| {batch:<17}| {dataset:<17}| {imgsz:<17}| {(compile_mode):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
-    else:
-        bf.write(f"| {model:<17}| {size:<17}| {dtype:<17}| {batch:<17}| {dataset:<17}| {imgsz:<17}| {(triton):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
+def print_table_row(bf, model, size, graph, dtype, batch, dataset, imgsz, triton, compile_mode, metrics_mAP50, ms_per_img, fps):
+    triton_mode = compile_mode if triton else triton
+    bf.write(f"| {model:<12}| {size:<10}| {graph:<9}| {dtype:<9}| {batch:<9}| {dataset:<17}| {imgsz:<17}| {(triton_mode):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
     bf.flush()
 
 
@@ -641,14 +640,14 @@ def main(models: List[str],
          device: str = DEFAULT_DEVICE,
          dtypes: List[bool] = DEFAULT_DTYPES,
          cmp_modes = COMPILE_MODES,
-         profiling = False,
-         use_graph = False):
+         profiling = False
+         ):
 
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
     os.makedirs(f"{CWD}/benchmarks/", exist_ok=True)
     with open(f"{CWD}/benchmarks/benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
         print_table_head(bf)
-        for dtype, model, batch, triton, in product(dtypes, models, batches, TRITON_TOGGLES):
+        for dtype, model, batch, triton, graph_on in product(dtypes, models, batches, TRITON_TOGGLES, GRAPH_TOGGLES):
             half = dtype == "fp16"
             int8 = dtype == "int8"
             if triton:
@@ -656,21 +655,21 @@ def main(models: List[str],
                 benchmark(
                     bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
                     half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode="default",
-                    warmup=True, use_graph=use_graph
+                    warmup=True, use_graph=graph_on
                 )
                 for compile_mode in cmp_modes:
                     print("\n")
                     benchmark(
                         bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
                         half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode,
-                        profiling=profiling, use_graph=use_graph
+                        profiling=profiling, use_graph=graph_on
                     )
             else:
                 print("\n")
                 benchmark(
                     bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
                     half=half, int8=int8, dtype=dtype, device=device, triton=triton,
-                    use_graph=use_graph
+                    use_graph=graph_on
                 )
 
             time.sleep(1)
@@ -680,5 +679,4 @@ if __name__ == "__main__":
     main(args.models, args.batches, args.dataset, args.imgsz, args.device, args.dtypes,
          cmp_modes=args.cmp_modes,
          profiling=args.profiling,
-         use_graph=args.use_graph
          )
