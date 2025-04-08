@@ -629,7 +629,7 @@ tr:nth-child(even) { background-color: rgba(99,99,99,0.3); }
 
 def print_table_row(bf, model, size, graph, dtype, batch, dataset, imgsz, triton, compile_mode, metrics_mAP50, ms_per_img, fps):
     triton_mode = compile_mode if triton else triton
-    bf.write(f"| {model:<12}| {size:<10}| {graph:<9}| {dtype:<9}| {batch:<9}| {dataset:<17}| {imgsz:<17}| {(triton_mode):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
+    bf.write(f"| {model:<12}| {size:<10}| {graph:<9}| {dtype:<9}| {batch:<8}| {dataset:<17}| {imgsz:<17}| {(triton_mode):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
     bf.flush()
 
 
