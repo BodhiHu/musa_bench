@@ -564,19 +564,21 @@ def benchmark(
                     with_flops=True,
                     with_modules=True,
                 ) as prof:
-                    exported_model.predict(
+                    for i in range(10):
+                        preds = exported_model.predict(
+                            ASSETS / "bus.jpg",
+                            imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
+                            use_graph=use_graph
+                        )
+                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
+                return
+            else:
+                for i in range(10):
+                    preds = exported_model.predict(
                         ASSETS / "bus.jpg",
                         imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
                         use_graph=use_graph
                     )
-                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
-                return
-            else:
-                exported_model.predict(
-                    ASSETS / "bus.jpg",
-                    imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
-                    use_graph=use_graph
-                )
 
             # Validate
             results = exported_model.val(

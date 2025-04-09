@@ -3,3 +3,4 @@ bench_dp4a
 logs/
 __pycache__
 datasets/
+*log*.txt

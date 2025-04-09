@@ -5,4 +5,4 @@ benchmarks*
 *.pth
 torch_compile_debug
 **/*.torchscript
-*trace.json
+*trace*.json
