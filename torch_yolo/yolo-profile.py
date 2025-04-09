@@ -43,12 +43,13 @@ if __name__ == "__main__":
         print("INFO: compiling model ...")
         model.model = torch.compile(model.model, backend="inductor", mode="default")
 
-    if not args.graph:
-        for i in range(10):
-            results = model.predict('images/bus.jpg', half=half)
+    # warmup model
+    for i in range(10):
+        results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
 
     current_ts = datetime.now().strftime("%Y%m%d-%H%M")
     device_name = get_device_name()
+    counts = 1
 
     if args.profiler == "plain":
         print("INFO: using plain profiler")
@@ -68,7 +69,7 @@ if __name__ == "__main__":
             with_modules=True,
             use_musa=True
         ) as prof:
-            for i in range(10):
+            for i in range(counts):
                 results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
         print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
         prof.export_chrome_trace(trace_file_name)
@@ -84,6 +85,6 @@ if __name__ == "__main__":
             with_modules=True,
             use_musa=True
         ) as prof:
-            for i in range(10):
+            for i in range(counts):
                 results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
         prof.export_chrome_trace(trace_file_name)

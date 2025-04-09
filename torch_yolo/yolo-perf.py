@@ -542,7 +542,7 @@ def benchmark(
             if warmup:
                 print("INFO: warming up model ...")
                 for _half in (True, False):
-                    for _ in range(3):
+                    for _ in range(10):
                         exported_model.predict(
                             ASSETS / "bus.jpg",
                             imgsz=imgsz, device=device, half=_half, int8=int8, verbose=False,
@@ -550,6 +550,7 @@ def benchmark(
                         )
                 return
 
+            counts = 30
             if profiling:
                 print(f"INFO: start profiling")
                 with torch.profiler.profile(
@@ -564,8 +565,8 @@ def benchmark(
                     with_flops=True,
                     with_modules=True,
                 ) as prof:
-                    for i in range(10):
-                        preds = exported_model.predict(
+                    for _ in range(counts):
+                        exported_model.predict(
                             ASSETS / "bus.jpg",
                             imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
                             use_graph=use_graph
@@ -573,8 +574,8 @@ def benchmark(
                 print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
                 return
             else:
-                for i in range(10):
-                    preds = exported_model.predict(
+                for _i in range(counts):
+                    exported_model.predict(
                         ASSETS / "bus.jpg",
                         imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
                         use_graph=use_graph
