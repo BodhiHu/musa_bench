@@ -30,6 +30,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
     parser.add_argument("--profiler",   default="plain", type=str, help="use plain or autograd profiler")
     parser.add_argument("--graph",      action="store_true", help="turn on musa graph")
+    parser.add_argument("--rounds",     default=1, type=int, help="rounds to profiles")
 
     args = parser.parse_args()
     half = args.dtype == "fp16"
@@ -49,7 +50,7 @@ if __name__ == "__main__":
 
     current_ts = datetime.now().strftime("%Y%m%d-%H%M")
     device_name = get_device_name()
-    counts = 1
+    rounds = args.rounds or 1
 
     if args.profiler == "plain":
         print("INFO: using plain profiler")
@@ -58,7 +59,7 @@ if __name__ == "__main__":
 
         with torch.profiler.profile(
             activities=[
-                torch.profiler.ProfilerActivity.CPU, 
+                torch.profiler.ProfilerActivity.CPU,
                 # torch.profiler.ProfilerActivity.CUDA
                 torch.profiler.ProfilerActivity.MUSA
             ],
@@ -69,7 +70,7 @@ if __name__ == "__main__":
             with_modules=True,
             use_musa=True
         ) as prof:
-            for i in range(counts):
+            for i in range(rounds):
                 results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
         print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
         prof.export_chrome_trace(trace_file_name)
@@ -85,6 +86,6 @@ if __name__ == "__main__":
             with_modules=True,
             use_musa=True
         ) as prof:
-            for i in range(counts):
+            for i in range(rounds):
                 results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
         prof.export_chrome_trace(trace_file_name)

@@ -550,14 +550,14 @@ def benchmark(
                         )
                 return
 
-            counts = 30
+            rounds = 30
             if profiling:
                 print(f"INFO: start profiling")
                 with torch.profiler.profile(
                     activities=[
                         torch.profiler.ProfilerActivity.CPU, 
-                        torch.profiler.ProfilerActivity.CUDA
-                        # torch.profiler.ProfilerActivity.MUSA
+                        # torch.profiler.ProfilerActivity.CUDA
+                        torch.profiler.ProfilerActivity.MUSA
                     ],
                     record_shapes=True,
                     profile_memory=True,
@@ -565,7 +565,7 @@ def benchmark(
                     with_flops=True,
                     with_modules=True,
                 ) as prof:
-                    for _ in range(counts):
+                    for _ in range(rounds):
                         exported_model.predict(
                             ASSETS / "bus.jpg",
                             imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
@@ -574,7 +574,7 @@ def benchmark(
                 print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
                 return
             else:
-                for _i in range(counts):
+                for _i in range(rounds):
                     exported_model.predict(
                         ASSETS / "bus.jpg",
                         imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
