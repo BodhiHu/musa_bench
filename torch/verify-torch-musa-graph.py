@@ -1,12 +1,8 @@
 import torch
 import torch_musa
-import torch_musa.cuda_compat
 import torch.nn as nn
 
-# Ensure CUDA is available
-assert torch.cuda.is_available(), "CUDA is not available"
-
-DEVICE = "cuda:0"
+DEVICE = "musa:0"
 
 # Simple model (Linear layer)
 class SimpleModel(nn.Module):
@@ -17,7 +13,7 @@ class SimpleModel(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
-# Instantiate and move to CUDA
+# Instantiate and move to MUSA
 model = SimpleModel().to(DEVICE)
 model.eval()
 
@@ -33,16 +29,17 @@ with torch.no_grad():
 # Output containers
 static_output = [None]
 
-# Create CUDA Graph
-g = torch.cuda.CUDAGraph()
+# Create MUSA Graph
+g = torch.musa.MUSAGraph()
 
 # Capture the graph
-with torch.cuda.graph(g):
+with torch.musa.graph(g):
     static_output[0] = model(x_static)
 
 # Run graph-based inference
 x_static.copy_(x_real)
 g.replay()
+torch.musa.synchronize()
 graph_output = static_output[0]
 
 # Compare with normal inference
@@ -51,6 +48,6 @@ with torch.no_grad():
 
 # Validate output is close
 if torch.allclose(graph_output, eager_output, atol=1e-6):
-    print("✅ CUDA Graph is working correctly!")
+    print("✅ MUSA Graph is working correctly!")
 else:
-    print("❌ CUDA Graph output does not match standard inference.")
+    print("❌ MUSA Graph output does not match standard inference.")

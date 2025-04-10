@@ -6,7 +6,7 @@ import torch.profiler
 
 
 USE_INDUCTOR = True
-PROFILING_ON = True
+PROFILING_ON = False
 device = torch.device("musa")
 
 class SimpleNN(nn.Module):
