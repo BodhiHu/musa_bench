@@ -109,7 +109,7 @@ def parse_args():
     parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
     parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
     parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env.")
-    parser.add_argument("-g", "--use-graph", action="store_true", help="turn on cuda/musa graph.")
+    parser.add_argument("-ng", "--no-graph", action="store_true", help="turn off cuda/musa graph.")
     parser.add_argument("-p", "--profiling", action="store_true", help="turn on perf profiling mode.")
 
     args = parser.parse_args()
@@ -121,8 +121,8 @@ def parse_args():
         TRITON_TOGGLES = [False]
     
     global GRAPH_TOGGLES
-    if args.use_graph:
-        GRAPH_TOGGLES = [True]
+    if args.no_graph:
+        GRAPH_TOGGLES = [False]
 
     return args
 
@@ -249,7 +249,7 @@ def benchmark(
             backend = "qnnpack"
             input_tensor = np.load('img_0.npy')
             input_tensor = torch.from_numpy(input_tensor)
-            full_quant = True
+            full_quant = False
 
             # Dynamic quant:
             if quant_method == "dynamic":
@@ -281,11 +281,12 @@ def benchmark(
 
                 print_mod = False
                 print_layers = False
-                fuse_ops = False
+                fuse_ops = True
                 matched_conv2d_name = None
                 matched_bn2d_name = None
 
                 if print_mod:
+                    print("==== BEFORE QUANT ===============================================")
                     print(model.model)
                 for name, module in model.model.named_modules():
                     if print_layers:
@@ -318,7 +319,11 @@ def benchmark(
                 # model.model.qconfig_dict = qconfig_dict
                 model_prepared = torch.quantization.prepare(model.model, allow_list=quant_list)
                 model_prepared(input_tensor)
-                model.model = torch.quantization.convert(model_prepared, allow_list=quant_list)
+                qmodel = torch.quantization.convert(model_prepared, allow_list=quant_list)
+                model.model = qmodel
+                if print_mod:
+                    print("==== AFTER  QUANT ===============================================")
+                    print(qmodel)
 
             # FX Graph Mode Quant:
             if quant_method == "fx":
@@ -469,6 +474,9 @@ def benchmark(
                 if nhwc:
                     _model = _model.to(memory_format=torch.channels_last)
 
+                # ensure model is symbolic traceable
+                # torch.fx.symbolic_trace(_model)
+
                 config = Config("static_quant_config.json")
                 config.device = device.type
                 compressor = build_compressor(_model, config, trace=CustomedTracer())
@@ -498,7 +506,6 @@ def benchmark(
             model.model.to(device).eval()
 
     model = YOLO(model)
-    may_compile_and_quant(model)
 
     is_end2end = getattr(model.model.model[-1], "end2end", False)
     data = data or TASK2DATA[model.task]  # task to dataset, i.e. coco8.yaml for task=detect
@@ -508,9 +515,6 @@ def benchmark(
     t0 = time.time()
 
     format_arg = format.lower()
-    # if format_arg:
-    #     formats = frozenset(export_formats()["Argument"])
-    #     assert format in formats, f"Expected format to be one of {formats}, but got '{format_arg}'."
 
     for i, (name, format, suffix, cpu, gpu, _) in enumerate(zip(*export_formats().values())):
         emoji, filename = "❌", None  # export defaults
@@ -535,7 +539,9 @@ def benchmark(
                 )
                 print("INFO: exported to", filename)
                 exported_model = YOLO(filename, task=model.task)
-                may_compile_and_quant(exported_model)
+
+
+            may_compile_and_quant(exported_model)
 
             emoji = "❎"  # indicates export succeeded
 
