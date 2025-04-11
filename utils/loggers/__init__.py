@@ -10,9 +10,9 @@ from pathlib import Path
 import pkg_resources as pkg
 import torch
 
-from utils.general import LOGGER, colorstr, cv2
-from utils.loggers.wandb.wandb_utils import WandbLogger
-from utils.torch_utils import de_parallel
+from .general import LOGGER, colorstr, cv2
+from .loggers.wandb.wandb_utils import WandbLogger
+from .torch_utils import de_parallel
 
 LOGGERS = (
     "csv",
@@ -57,7 +57,7 @@ try:
         import comet_ml
 
         assert hasattr(comet_ml, "__version__")  # verify package import not local dir
-        from utils.loggers.comet import CometLogger
+        from .loggers.comet import CometLogger
 
     else:
         comet_ml = None
@@ -354,7 +354,7 @@ class Loggers:
 class GenericLogger:
     """
     YOLOv5 General purpose logger for non-task specific logging
-    Usage: from utils.loggers import GenericLogger; logger = GenericLogger(...)
+    Usage: from .loggers import GenericLogger; logger = GenericLogger(...)
     Arguments
         opt:             Run arguments
         console_logger:  Console logger

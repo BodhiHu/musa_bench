@@ -2,6 +2,7 @@
 
 import copy
 from functools import partial
+import inspect
 import os
 import re
 import sys
@@ -11,8 +12,10 @@ import logging
 import platform
 import torch
 import torch_musa
+from torch import fx
 from tqdm import tqdm
 from datetime import datetime
+import ultralytics
 from ultralytics import YOLO
 from ultralytics.cfg import TASK2DATA, TASK2METRIC
 from ultralytics.engine.exporter import export_formats
@@ -28,6 +31,8 @@ from typing import List
 from pathlib import Path
 from typing import Literal
 from torch.ao.quantization import quantize_fx, HistogramObserver, MinMaxObserver, QConfig
+from torch.ao.quantization.fx.custom_config import PrepareCustomConfig
+from torch.ao.quantization.qconfig_mapping import QConfigMapping
 
 try:
     import torch_musa.cuda_compat
@@ -92,6 +97,7 @@ COMPILE_MODES = [
     "max-autotune",
     "max-autotune-no-cudagraphs",
 ]
+DEFAULT_ROUNDS = 30
 CWD = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -110,6 +116,7 @@ def parse_args():
     parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
     parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env.")
     parser.add_argument("-ng", "--no-graph", action="store_true", help="turn off cuda/musa graph.")
+    parser.add_argument("--rounds", default=DEFAULT_ROUNDS, type=int, help="rounds to run")
     parser.add_argument("-p", "--profiling", action="store_true", help="turn on perf profiling mode.")
 
     args = parser.parse_args()
@@ -223,6 +230,9 @@ def benchmark(
     device = select_device(device, verbose=False)
 
     def may_compile_and_quant(model: YOLO):
+        # fuse conv2d and bn
+        model.fuse()
+
         if triton:
             if type(model.model) == str:
                 print(f"WARN: will not call compile for model.model of type = {type(model.model)}")
@@ -249,205 +259,166 @@ def benchmark(
             backend = "qnnpack"
             input_tensor = np.load('img_0.npy')
             input_tensor = torch.from_numpy(input_tensor)
-            full_quant = False
+            print_mod = False
+            print_layers = True
+
+            _model = model.model
+
+            if print_mod:
+                print("==== BEFORE QUANT ===============================================")
+                print(_model)
+            for name, module in _model.named_modules():
+                if print_layers:
+                    print(f"{name:<24} :: {type(module)}")
 
             # Dynamic quant:
             if quant_method == "dynamic":
                 model.model = torch.quantization.quantize_dynamic(
-                    model.model,
+                    _model,
                     dtype=torch.qint8
                 )
 
             # Static quant:
             if quant_method == "static":
-                Conv2d      = torch.nn.modules.conv.Conv2d
-                BatchNorm2d = torch.nn.modules.batchnorm.BatchNorm2d
-
                 # Quant to int8
+                # torch.quantization.get_default_qconfig("qnnpack")
                 qcfg = QConfig(
                     activation=HistogramObserver.with_args(reduce_range=False, dtype=torch.qint8),
                     weight=MinMaxObserver.with_args(qscheme=torch.per_tensor_symmetric, dtype=torch.qint8)
                 )
                 quant_list = [
                     torch.nn.modules.conv.Conv2d,
-                    torch.nn.MaxPool2d,
-                    torch.mul,
-                    torch.add,
-                    torch.nn.Sigmoid,
-                    torch.split,
+                    torch.nn.modules.pooling.MaxPool2d,
+                    # torch.mul,
+                    # torch.add,
+                    # torch.nn.Sigmoid,
+                    # torch.split,
                 ]
+                full_quant = False
+                calibration_on = False
+
                 if full_quant:
                     quant_list = None
 
-                print_mod = False
-                print_layers = False
-                fuse_ops = True
-                matched_conv2d_name = None
-                matched_bn2d_name = None
-
-                if print_mod:
-                    print("==== BEFORE QUANT ===============================================")
-                    print(model.model)
-                for name, module in model.model.named_modules():
-                    if print_layers:
-                        print(f"{name:<24} :: {type(module)}")
+                _model.qconfig = qcfg
+                for name, module in _model.named_modules():
                     if quant_list is None or type(module) in quant_list:
                         module.qconfig = qcfg
-                    if fuse_ops:
-                        # if re.search("activation.*", str(type(module)), re.IGNORECASE):
-                        #     print("  => will not quantize")
-                        #     matched_conv2d_name, matched_bn2d_name = None, None
-                        #     continue
 
-                        if isinstance(module, Conv2d):
-                            matched_conv2d_name = name
-                            continue
-                        if isinstance(module, BatchNorm2d):
-                            matched_bn2d_name = name
-                            assert matched_conv2d_name is not None and matched_bn2d_name is not None
-                            # fuse conv2d and bn2d
-                            print(f"  => Fusing {matched_conv2d_name} and {matched_bn2d_name}")
-                            torch.quantization.fuse_modules(
-                                model.model,
-                                [ matched_conv2d_name, matched_bn2d_name ],
-                                inplace=True
-                            )
-                        matched_conv2d_name, matched_bn2d_name = None, None
+                model_prepared = torch.quantization.prepare(_model, allow_list=quant_list)
 
-                # model.model.qconfig = torch.quantization.get_default_qconfig("qnnpack")
-                model.model.qconfig = qcfg
-                # model.model.qconfig_dict = qconfig_dict
-                model_prepared = torch.quantization.prepare(model.model, allow_list=quant_list)
+                if calibration_on:
+                    from .utils import calibrate
+                    task = "val"  # path to train/val/test images
+                    stride = max(int(_model.stride.max()), 32)
+                    single_cls=False
+                    pad = 0.5
+                    rect = True
+                    workers = 8
+                    calib_data = yaml_load(f"cfg/datasets/coco128.yaml")
+                    dataloader = create_dataloader(
+                        "datasets/coco128/" + calib_data[task],
+                        imgsz,
+                        batch,
+                        stride,
+                        single_cls,
+                        pad=pad,
+                        rect=rect,
+                        workers=workers,
+                        prefix=colorstr(f"{task}: "),
+                    )[0]
+                    calibrate(model_prepared, dataloader)
+
                 model_prepared(input_tensor)
                 qmodel = torch.quantization.convert(model_prepared, allow_list=quant_list)
-                model.model = qmodel
-                if print_mod:
-                    print("==== AFTER  QUANT ===============================================")
-                    print(qmodel)
+                if hasattr(_model, "stride"):
+                    qmodel.stride = _model.stride
+                qmodel.names = _model.module.names if hasattr(_model, "module") else _model.names
+                # from musa_bench.utils.replace_quant_modules import replace_nnq_modules
+                # for name, module in qmodel.named_modules():
+                #     if type(module) in quant_list:
+                #         wrapped_m = replace_nnq_modules(module)
+                model.model = qmodel # .half()
 
             # FX Graph Mode Quant:
             if quant_method == "fx":
+
+                _model = model.model
+                input_tensor = np.load('img_0.npy')
+                input_tensor = torch.from_numpy(input_tensor).to(device)
+                _model.to(device)
+                with torch.no_grad():
+                    _model(input_tensor)
+
+                print(f"\nmodel layers >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+                traceable_clszs   = set()
+                untraceable_clszs = set()
+                for name, module in _model.named_modules():
+                    is_traceable = False
+                    try:
+                        torch.fx.symbolic_trace(module)
+                        is_traceable = True
+                        traceable_clszs.add(type(module))
+                        # print(f">>>> trace success {type(module)}")
+                    except Exception as exc:
+                        # print(">>>> trace error:\n", exc)
+                        untraceable_clszs.add(type(module))
+                        pass
+                    print(f"{name:<24} :: {str(type(module)):<50} | is_traceable {'✔ ' if is_traceable else '❌'} |")
+
+                print("\ntraceable_clszs =\n"   + '\n'.join(str(item) for item in traceable_clszs))
+                print("\nuntraceable_clszs =\n" + '\n'.join(str(item) for item in untraceable_clszs))
+
                 qcfg = QConfig(
                     activation=HistogramObserver.with_args(reduce_range=False, dtype=torch.qint8),
                     weight=MinMaxObserver.with_args(qscheme=torch.per_tensor_symmetric, dtype=torch.qint8)
                 )
+                # _ = torch.ao.quantization.get_default_qconfig(backend)
                 qconfig_dict = {
                     # "": torch.ao.quantization.get_default_qconfig(backend),  # Apply to all ops
                     # "": qcfg,
-                    torch.nn.Conv2d:    qcfg,
-                    torch.nn.MaxPool2d: qcfg,
-                    torch.mul:          qcfg,
-                    torch.add:          qcfg,
-                    torch.nn.Sigmoid:   qcfg,
-                    torch.split:        qcfg
+                    torch.nn.modules.conv.Conv2d:       qcfg,
+                    torch.nn.modules.pooling.MaxPool2d: qcfg,
                 }
-                model_prepared = quantize_fx.prepare_fx(model.model, qconfig_dict, (input_tensor))
+                qconfig_mapping = QConfigMapping() \
+                    .set_global(qcfg) \
+                    .set_object_type(torch.nn.modules.conv.Conv2d, qcfg) \
+                    .set_object_type(torch.nn.modules.pooling.MaxPool2d, qcfg)
+
+                prepare_custom_config = PrepareCustomConfig() \
+                    .set_non_traceable_module_classes([
+                        # ultralytics.nn.tasks.DetectionModel,
+                        # torch.nn.modules.container.Sequential,
+                        ultralytics.nn.modules.head.Detect,
+                        # ultralytics.nn.modules.conv.Conv,
+                        # torch.nn.modules.container.ModuleList,
+                        # ultralytics.nn.modules.conv.Concat,
+                        ultralytics.nn.modules.block.C2f,
+                    ])
+                model_prepared = quantize_fx.prepare_fx(
+                    _model,
+                    qconfig_mapping, # qconfig_dict,
+                    (input_tensor),
+                    prepare_custom_config=prepare_custom_config,
+                )
                 model_prepared(input_tensor)
                 model_quantized = quantize_fx.convert_fx(model_prepared)
-                model.model = model_quantized
+                print("\nAFTER QUANT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+                for name, module in model_quantized.named_modules():
+                    print(f"{name:<24} :: {type(module)}")
+                # print(model_quantized)
+                if hasattr(_model, "stride"):
+                    model_quantized.stride = _model.stride
+                model_quantized.names = _model.module.names if hasattr(_model, "module") else _model.names
+                model.model = model_quantized.half()
 
             if quant_method == "neuro-fx":
-                from torch import fx
                 from neurotrim.compression.config import Config
                 from neurotrim.compression.builder import build_compressor
                 from neurotrim.graph.graph_optimizer import GraphOptimizer
                 from musa_bench.utils.dataloaders import create_dataloader
                 from musa_bench.utils.general import colorstr, yaml_load
-
-                class CustomedTracer(fx.Tracer):
-                    """
-                    ``Tracer`` is the class that implements the symbolic tracing functionality
-                    of ``torch.fx.symbolic_trace``. A call to ``symbolic_trace(m)`` is equivalent
-                    to ``Tracer().trace(m)``.
-                    This Tracer override the ``is_leaf_module`` function to make symbolic trace
-                    right in some cases.
-                    """
-
-                    def __init__(self, *args, customed_leaf_module=None, **kwargs):
-                        super().__init__(*args, **kwargs)
-                        self.customed_leaf_module = customed_leaf_module
-
-                    def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str) -> bool:
-                        """
-                        A method to specify whether a given ``nn.Module`` is a "leaf" module.
-                        Leaf modules are the atomic units that appear in
-                        the IR, referenced by ``call_module`` calls. By default,
-                        Modules in the PyTorch standard library namespace (torch.nn)
-                        are leaf modules. All other modules are traced through and
-                        their constituent ops are recorded, unless specified otherwise
-                        via this parameter.
-                        Args:
-                            m (Module): The module being queried about
-                            module_qualified_name (str): The path to root of this module. For example,
-                                if you have a module hierarchy where submodule ``foo`` contains
-                                submodule ``bar``, which contains submodule ``baz``, that module will
-                                appear with the qualified name ``foo.bar.baz`` here.
-                        """
-                        if self.customed_leaf_module and isinstance(m, self.customed_leaf_module):
-                            return True
-
-                        if hasattr(m, "_is_leaf_module") and m._is_leaf_module:
-                            return True
-
-                        return m.__module__.startswith("torch.nn") and not isinstance(
-                            m, torch.nn.Sequential
-                        )
-
-                def calibrate(model, dataloader, steps=30):
-                    for batch_i, (imgs, _, _, _) in tqdm(enumerate(dataloader)):
-                        imgs = imgs.float()
-                        imgs /= 255  # 0 - 255 to 0.0 - 1.0
-
-                        # Inference
-                        _, _ = model(imgs)  # inference, loss outputs
-                        if batch_i >= steps:
-                            return
-
-                def _getattr(model, name):
-                    """customize getattr function to recursive get attribute for pytorch module"""
-                    name_list = name.split(".")
-                    for name in name_list:  # pylint: disable=redefined-argument-from-local
-                        model = getattr(model, name)
-                    return model
-
-                def postprocess(model: fx.GraphModule):
-                    """replace float add to quantized one, reduce dequantize ops"""
-                    for node in model.graph.nodes:
-                        if node.op != "call_module":
-                            continue
-                        if not isinstance(_getattr(model, node.target), torch.nn.Upsample):
-                            continue
-                        args = node.args
-                        assert len(args) == 1
-                        up_arg = args[0]
-                        if up_arg.target == "dequantize":
-                            quant_arg = up_arg.args[0]
-                        else:
-                            continue
-                        assert len(node.users) == 1
-                        cat_node = list(node.users.keys())[0]
-                        assert cat_node.target == torch.cat
-                        cat_inputs = cat_node.args[0]
-                        flag = True
-                        for cat_inp in cat_inputs:
-                            if cat_inp is node:
-                                continue
-                            if cat_inp.target == "dequantize":
-                                cat_quant = cat_inp.args[0]
-                                cat_inp.replace_all_uses_with(cat_quant)
-                                model.graph.erase_node(cat_inp)
-                            else:
-                                flag = False
-                        if flag and len(cat_node.users) == 1:
-                            up_arg.replace_all_uses_with(quant_arg)
-                            model.graph.erase_node(up_arg)
-                            late_node = list(cat_node.users.keys())[0]
-                            assert late_node.target == torch.quantize_per_tensor
-                            late_node.replace_all_uses_with(cat_node)
-                            model.graph.erase_node(late_node)
-
-                    model.graph.lint()
-                    model.recompile()
+                from musa_bench.utils.quant_utils import CustomedTracer, calibrate, postprocess
 
                 _model = model.model
                 _model.to("cpu").eval()
@@ -489,6 +460,9 @@ def benchmark(
                 postprocess(qmodel)
                 model.model = qmodel
 
+            if print_mod:
+                print("==== AFTER  QUANT ===============================================")
+                print(model.model)
             if print_layers:
                 print("")
                 print("=============================================================================")
@@ -556,7 +530,7 @@ def benchmark(
                         )
                 return
 
-            rounds = 30
+            rounds = args.rounds
             if profiling:
                 print(f"INFO: start profiling")
                 with torch.profiler.profile(
@@ -657,8 +631,8 @@ def main(models: List[str],
     with open(f"{CWD}/benchmarks/benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
         print_table_head(bf)
         for dtype, model, batch, triton, graph_on in product(dtypes, models, batches, TRITON_TOGGLES, GRAPH_TOGGLES):
-            half = dtype == "fp16"
             int8 = dtype == "int8"
+            half = dtype == "fp16" #int8 or (dtype == "fp16")
             if triton:
                 print("INFO: torch compile warming up...")
                 benchmark(

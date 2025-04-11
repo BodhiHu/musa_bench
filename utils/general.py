@@ -35,9 +35,9 @@ import torch
 import torchvision
 import yaml
 
-from utils import TryExcept, emojis
-from utils.downloads import curl_download
-from utils.metrics import box_iou
+from . import TryExcept, emojis
+from .downloads import curl_download
+from .metrics import box_iou
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory

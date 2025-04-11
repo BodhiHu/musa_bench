@@ -9,14 +9,14 @@ import random
 import cv2
 import numpy as np
 
-from utils.general import (
+from .general import (
     LOGGER,
     check_version,
     colorstr,
     resample_segments,
     segment2box,
 )
-from utils.metrics import bbox_ioa
+from .metrics import bbox_ioa
 
 IMAGENET_MEAN = 0.485, 0.456, 0.406  # RGB mean
 IMAGENET_STD = 0.229, 0.224, 0.225  # RGB standard deviation

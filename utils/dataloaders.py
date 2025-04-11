@@ -21,7 +21,7 @@ from PIL import ExifTags, Image, ImageOps
 from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
 
-from utils.augmentations import (
+from .augmentations import (
     Albumentations,
     augment_hsv,
     copy_paste,
@@ -29,7 +29,7 @@ from utils.augmentations import (
     mixup,
     random_perspective,
 )
-from utils.general import (
+from .general import (
     LOGGER,
     NUM_THREADS,
     TQDM_BAR_FORMAT,
@@ -39,7 +39,7 @@ from utils.general import (
     xywhn2xyxy,
     xyxy2xywhn,
 )
-from utils.torch_utils import torch_distributed_zero_first
+from .torch_utils import torch_distributed_zero_first
 
 # Parameters
 HELP_URL = "See https://docs.ultralytics.com/yolov5/tutorials/train_custom_data"

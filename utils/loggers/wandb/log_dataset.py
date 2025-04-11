@@ -1,7 +1,7 @@
 # pylint: skip-file
 import argparse
 
-from utils.general import LOGGER
+from .general import LOGGER
 
 from wandb_utils import WandbLogger
 
