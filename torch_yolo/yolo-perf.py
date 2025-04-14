@@ -502,7 +502,6 @@ def benchmark(
             if format_arg and format_arg != format:
                 continue
 
-            print(f"INFO: format = {format}, use_graph = {use_graph}, batch = {batch}, triton = {compile_mode if triton else triton}, dtype = {dtype}, half={half}, int8={int8}")
             if format == "-":
                 filename = model.pt_path or model.ckpt_path or model.model_name
                 exported_model = model  # PyTorch format
@@ -520,20 +519,20 @@ def benchmark(
                 print("INFO: exported to", filename)
                 exported_model = YOLO(filename, task=model.task)
 
-
             may_compile_and_quant(exported_model)
 
             emoji = "❎"  # indicates export succeeded
 
+            print(f"INFO: format = {format}, use_graph = {use_graph}, batch = {batch}, triton = {compile_mode if triton else triton}, dtype = {dtype}, half={half}, int8={int8}")
+
             if warmup:
                 print("INFO: warming up model ...")
-                for _half in (True, False):
-                    for _ in range(10):
-                        exported_model.predict(
-                            ASSETS / "bus.jpg",
-                            imgsz=imgsz, device=device, half=_half, int8=int8, verbose=False,
-                            use_graph=use_graph
-                        )
+                for _ in range(10):
+                    exported_model.predict(
+                        ASSETS / "bus.jpg",
+                        imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
+                        use_graph=use_graph
+                    )
                 return
 
             rounds = args.rounds
@@ -638,7 +637,7 @@ def main(models: List[str],
         print_table_head(bf)
         for dtype, model, batch, triton, graph_on in product(dtypes, models, batches, TRITON_TOGGLES, GRAPH_TOGGLES):
             int8 = dtype == "int8"
-            half = dtype == "fp16" #int8 or (dtype == "fp16")
+            half = dtype == "fp16"
             if triton:
                 print("INFO: torch compile warming up...")
                 benchmark(
