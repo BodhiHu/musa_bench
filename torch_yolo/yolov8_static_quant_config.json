@@ -18,7 +18,7 @@
             },
             "activation": {
                 "quant_per_channel": false,
-                "quant_symmetric": false,
+                "quant_symmetric": true,
                 "type": "histogram"
             }
         },

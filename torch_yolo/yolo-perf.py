@@ -474,7 +474,7 @@ def benchmark(
                 print("=============================================================================")
                 print("Model after quantization:")
                 for name, module in model.model.named_modules():
-                    print(f"{name:<24} :: {type(module)}")
+                    print(f"{name:<30} :: {type(module)}")
                 print("=============================================================================")
                 print("")
 
@@ -482,7 +482,7 @@ def benchmark(
             if os.path.exists(quanzied_model_file):
                 os.remove(quanzied_model_file)
             torch.save(model.model, quanzied_model_file)
-            print(f"INFO: saved quantized model({type(model.model)}) to {quanzied_model_file}")
+            print(f"INFO: saved quantized model({type(model.model)}) to {quanzied_model_file}, size = {os.path.getsize(quanzied_model_file) / (1024**2):.2f}MB")
             model.model.to(device).eval()
 
     model = YOLO(model)
