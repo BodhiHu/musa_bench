@@ -8,19 +8,7 @@ import torch_musa
 import torch_musa.cuda_compat
 import numpy as np
 import subprocess
-
-
-def get_device_name():
-    # Run musaInfo and capture output
-    result = subprocess.run(["musaInfo"], capture_output=True, text=True)
-    output = result.stdout
-
-    # Find the Name line
-    match = re.search(r"Name:\s+(.*)", output)
-    if match:
-        name = match.group(1).strip().replace("MTT ", "")
-        return name
-    return "unknown"
+from musa_bench.utils.general import get_device_name
 
 
 if __name__ == "__main__":

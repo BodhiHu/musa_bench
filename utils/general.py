@@ -1133,3 +1133,16 @@ def colorstr(*input):
     }
     return "".join(colors[x] for x in args) + f"{string}" + colors["end"]
 
+
+def get_device_name():
+    # Run musaInfo and capture output
+    result = subprocess.run(["musaInfo"], capture_output=True, text=True)
+    output = result.stdout
+
+    # Find the Name line
+    match = re.search(r"Name:\s+(.*)", output)
+    if match:
+        name = match.group(1).strip().replace("MTT ", "")
+        return name
+    return "unknown"
+

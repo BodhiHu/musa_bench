@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 
+import os, sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(current_dir)
+sys.path.append(os.path.abspath(f"{current_dir}/.."))
+sys.path.append(os.path.abspath(f"{current_dir}/../.."))
+
 import copy
 from functools import partial
 import inspect
-import os
 import re
-import sys
 import traceback
 import numpy as np
 import logging
@@ -23,7 +28,6 @@ from ultralytics.utils import ASSETS, LOGGER
 from ultralytics.utils.checks import check_imgsz, check_yolo
 from ultralytics.utils.files import file_size
 from ultralytics.utils.torch_utils import select_device
-
 import argparse
 import time
 from itertools import product
@@ -33,6 +37,7 @@ from typing import Literal
 from torch.ao.quantization import quantize_fx, HistogramObserver, MinMaxObserver, QConfig
 from torch.ao.quantization.fx.custom_config import PrepareCustomConfig
 from torch.ao.quantization.qconfig_mapping import QConfigMapping
+from musa_bench.utils.general import get_device_name
 
 try:
     import torch_musa.cuda_compat
@@ -44,13 +49,6 @@ except Exception as exc:
     torch.cuda = torch.musa
     torch.cuda.CUDAGraph = torch.musa.MUSAGraph
 
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-os.chdir(current_dir)
-sys.path.append(os.path.abspath(f"{current_dir}/.."))
-sys.path.append(os.path.abspath(f"{current_dir}/../.."))
-
-# torch._dynamo.config.cache_size_limit = 128
 
 DEFAULT_MODELS = [
     #"yolov5n.pt",
@@ -99,7 +97,7 @@ COMPILE_MODES = [
 ]
 DEFAULT_ROUNDS = 30
 CWD = os.path.dirname(os.path.abspath(__file__))
-
+DEVICE_NAME = get_device_name()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run YOLO benchmarks.")
@@ -118,6 +116,8 @@ def parse_args():
     parser.add_argument("-ng", "--no-graph", action="store_true", help="turn off cuda/musa graph.")
     parser.add_argument("--rounds", default=DEFAULT_ROUNDS, type=int, help="rounds to run")
     parser.add_argument("-p", "--profiling", action="store_true", help="turn on perf profiling mode.")
+    parser.add_argument("-pm", "--print_model", action="store_true", help="print model info.")
+    parser.add_argument("-pp", "--print_layers", action="store_true", help="print model layers.")
 
     args = parser.parse_args()
 
@@ -230,7 +230,8 @@ def benchmark(
     device = select_device(device, verbose=False)
 
     def print_model_layers_info(_model):
-        print(f"\nmodel layers info >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+        if args.print_layers:
+            print("\n==== model layers info ==========================================================")
         traceable_clszs   = set()
         untraceable_clszs = set()
         for name, module in _model.named_modules():
@@ -239,12 +240,11 @@ def benchmark(
                 torch.fx.symbolic_trace(module)
                 is_traceable = True
                 traceable_clszs.add(type(module))
-                # print(f">>>> trace success {type(module)}")
             except Exception as exc:
-                # print(">>>> trace error:\n", exc)
                 untraceable_clszs.add(type(module))
                 pass
-            print(f"{name:<30} :: {str(type(module)):<50} | is_traceable {'✔ ' if is_traceable else '❌'} |")
+            if args.print_layers:
+                print(f"{name:<30} :: {str(type(module)):<50} | is_traceable {'✔ ' if is_traceable else '❌'} |")
 
         print("\ntraceable_clszs =\n"   + '\n'.join(str(item) for item in traceable_clszs))
         print("\nuntraceable_clszs =\n" + '\n'.join(str(item) for item in untraceable_clszs))
@@ -282,13 +282,13 @@ def benchmark(
             backend = "qnnpack"
             input_tensor = np.load('img_0.npy')
             input_tensor = torch.from_numpy(input_tensor)
-            print_mod = False
-            print_layers = True
+            print_mod = args.print_model
+            print_layers = args.print_layers
 
             _model = model.model
 
             if print_mod:
-                print("==== BEFORE QUANT ===============================================")
+                print("==== BEFORE QUANT (**after fuse**) ===============================================")
                 print(_model)
 
             # Dynamic quant:
@@ -328,7 +328,7 @@ def benchmark(
                 model_prepared = torch.quantization.prepare(_model, allow_list=quant_list)
 
                 if calibration_on:
-                    from .utils import calibrate
+                    from musa_bench.utils.quant_utils import calibrate
                     task = "val"  # path to train/val/test images
                     stride = max(int(_model.stride.max()), 32)
                     single_cls=False
@@ -406,9 +406,6 @@ def benchmark(
                 )
                 model_prepared(input_tensor)
                 model_quantized = quantize_fx.convert_fx(model_prepared)
-                print("\nAFTER QUANT >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
-                for name, module in model_quantized.named_modules():
-                    print(f"{name:<24} :: {type(module)}")
                 # print(model_quantized)
                 if hasattr(_model, "stride"):
                     model_quantized.stride = _model.stride
@@ -466,16 +463,14 @@ def benchmark(
                 postprocess(qmodel)
                 model.model = qmodel
 
+            if print_mod or print_layers:
+                print("==== AFTER  QUANT ==========================================================")
             if print_mod:
-                print("==== AFTER  QUANT ===============================================")
                 print(model.model)
             if print_layers:
                 print("")
-                print("=============================================================================")
-                print("Model after quantization:")
                 for name, module in model.model.named_modules():
                     print(f"{name:<30} :: {type(module)}")
-                print("=============================================================================")
                 print("")
 
             quanzied_model_file = f"{model.model_name.replace('.pt', '')}-{dtype}-{quant_method}.pth"
@@ -525,17 +520,26 @@ def benchmark(
 
             print(f"INFO: format = {format}, use_graph = {use_graph}, batch = {batch}, triton = {compile_mode if triton else triton}, dtype = {dtype}, half={half}, int8={int8}")
 
-            if warmup:
-                print("INFO: warming up model ...")
-                for _ in range(10):
+            rounds = args.rounds
+            if profiling:
+                rounds = 1
+
+            def rounds_predict(warmup = False):
+                _rounds = rounds if not warmup else 10
+                print("INFO: rounds =", _rounds)
+                for _ in range(_rounds):
                     exported_model.predict(
                         ASSETS / "bus.jpg",
                         imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
                         use_graph=use_graph
                     )
+
+            if warmup:
+                print("INFO: warming up model ...")
+                rounds_predict(warmup=True)
                 return
 
-            rounds = args.rounds
+            current_ts = datetime.now().strftime("%Y%m%d-%H%M")
             if profiling:
                 print(f"INFO: start profiling")
                 with torch.profiler.profile(
@@ -549,22 +553,15 @@ def benchmark(
                     with_stack=True,
                     with_flops=True,
                     with_modules=True,
+                    use_musa=True
                 ) as prof:
-                    for _ in range(rounds):
-                        exported_model.predict(
-                            ASSETS / "bus.jpg",
-                            imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
-                            use_graph=use_graph
-                        )
-                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
-                return
+                    rounds_predict()
+                print(prof.key_averages().table(sort_by="self_musa_time_total", row_limit=100))
+                trace_file_name = f"perf-trace-{DEVICE_NAME}-{current_ts}.json"
+                prof.export_chrome_trace(trace_file_name)
+                exit(0)
             else:
-                for _i in range(rounds):
-                    exported_model.predict(
-                        ASSETS / "bus.jpg",
-                        imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
-                        use_graph=use_graph
-                    )
+                rounds_predict()
 
             # Validate
             results = exported_model.val(
@@ -633,32 +630,29 @@ def main(models: List[str],
 
     current_ts = datetime.now().strftime("%Y%m%d:%H%M")
     os.makedirs(f"{CWD}/benchmarks/", exist_ok=True)
+
     with open(f"{CWD}/benchmarks/benchmarks-table-{current_ts}.md", "w", errors="ignore", encoding="utf-8") as bf:
         print_table_head(bf)
         for dtype, model, batch, triton, graph_on in product(dtypes, models, batches, TRITON_TOGGLES, GRAPH_TOGGLES):
             int8 = dtype == "int8"
             half = dtype == "fp16"
+
+            def _benchmark(warmup=False, compile_mode=None):
+                benchmark(
+                    bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
+                    half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode,
+                    warmup=warmup, profiling=profiling, use_graph=graph_on
+                )
+
             if triton:
                 print("INFO: torch compile warming up...")
-                benchmark(
-                    bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
-                    half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode="default",
-                    warmup=True, use_graph=graph_on
-                )
+                _benchmark(warmup=True, compile_mode="default")
                 for compile_mode in cmp_modes:
                     print("\n")
-                    benchmark(
-                        bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
-                        half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode,
-                        profiling=profiling, use_graph=graph_on
-                    )
+                    _benchmark(compile_mode=compile_mode)
             else:
                 print("\n")
-                benchmark(
-                    bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
-                    half=half, int8=int8, dtype=dtype, device=device, triton=triton,
-                    use_graph=graph_on
-                )
+                _benchmark()
 
             time.sleep(1)
 
