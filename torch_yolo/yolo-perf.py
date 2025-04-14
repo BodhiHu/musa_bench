@@ -229,6 +229,29 @@ def benchmark(
     pd.options.display.width = 120
     device = select_device(device, verbose=False)
 
+    def print_model_layers_info(_model):
+        print(f"\nmodel layers info >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+        traceable_clszs   = set()
+        untraceable_clszs = set()
+        for name, module in _model.named_modules():
+            is_traceable = False
+            try:
+                torch.fx.symbolic_trace(module)
+                is_traceable = True
+                traceable_clszs.add(type(module))
+                # print(f">>>> trace success {type(module)}")
+            except Exception as exc:
+                # print(">>>> trace error:\n", exc)
+                untraceable_clszs.add(type(module))
+                pass
+            print(f"{name:<30} :: {str(type(module)):<50} | is_traceable {'✔ ' if is_traceable else '❌'} |")
+
+        print("\ntraceable_clszs =\n"   + '\n'.join(str(item) for item in traceable_clszs))
+        print("\nuntraceable_clszs =\n" + '\n'.join(str(item) for item in untraceable_clszs))
+        print("\n")
+
+        return (traceable_clszs, untraceable_clszs)
+
     def may_compile_and_quant(model: YOLO):
         # fuse conv2d and bn
         model.fuse()
@@ -267,9 +290,6 @@ def benchmark(
             if print_mod:
                 print("==== BEFORE QUANT ===============================================")
                 print(_model)
-            for name, module in _model.named_modules():
-                if print_layers:
-                    print(f"{name:<24} :: {type(module)}")
 
             # Dynamic quant:
             if quant_method == "dynamic":
@@ -350,24 +370,7 @@ def benchmark(
                 with torch.no_grad():
                     _model(input_tensor)
 
-                print(f"\nmodel layers >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
-                traceable_clszs   = set()
-                untraceable_clszs = set()
-                for name, module in _model.named_modules():
-                    is_traceable = False
-                    try:
-                        torch.fx.symbolic_trace(module)
-                        is_traceable = True
-                        traceable_clszs.add(type(module))
-                        # print(f">>>> trace success {type(module)}")
-                    except Exception as exc:
-                        # print(">>>> trace error:\n", exc)
-                        untraceable_clszs.add(type(module))
-                        pass
-                    print(f"{name:<24} :: {str(type(module)):<50} | is_traceable {'✔ ' if is_traceable else '❌'} |")
-
-                print("\ntraceable_clszs =\n"   + '\n'.join(str(item) for item in traceable_clszs))
-                print("\nuntraceable_clszs =\n" + '\n'.join(str(item) for item in untraceable_clszs))
+                print_model_layers_info(_model)
 
                 qcfg = QConfig(
                     activation=HistogramObserver.with_args(reduce_range=False, dtype=torch.qint8),
@@ -445,14 +448,17 @@ def benchmark(
                 if nhwc:
                     _model = _model.to(memory_format=torch.channels_last)
 
-                # ensure model is symbolic traceable
-                # torch.fx.symbolic_trace(_model)
+                (_, untraceable_clszs) = print_model_layers_info(_model)
 
-                config = Config("static_quant_config.json")
+                config = Config("yolov8_static_quant_config.json")
                 config.device = device.type
-                compressor = build_compressor(_model, config, trace=CustomedTracer())
+                use_trace = len(untraceable_clszs) <= 0
+                compressor = build_compressor(_model, config, trace=False) if not use_trace else \
+                             build_compressor(_model, config, tracer=CustomedTracer())
+
+                calib_steps = 3 # 30
                 compressor.compress(
-                    calib_data=dataloader, calib_func=partial(calibrate, steps=30)
+                    calib_data=dataloader, calib_func=partial(calibrate, steps=calib_steps)
                 )
                 graph_opt = GraphOptimizer(compressor)
                 qmodel = graph_opt.optimize()

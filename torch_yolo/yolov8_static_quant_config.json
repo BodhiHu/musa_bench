@@ -8,7 +8,7 @@
             "activation", "weight"
         ],
         "op_types": [
-            "conv", "linear", "lstm"
+            "conv"
         ],
         "observers": {
             "weight": {

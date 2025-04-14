@@ -1,6 +1,6 @@
 import torch
-import tqdm
 from torch import fx
+from tqdm import tqdm
 
 class CustomedTracer(fx.Tracer):
     """
@@ -60,6 +60,9 @@ def _getattr(model, name):
 
 def postprocess(model: fx.GraphModule):
     """replace float add to quantized one, reduce dequantize ops"""
+    if not isinstance(model, fx.GraphModule):
+        return
+
     for node in model.graph.nodes:
         if node.op != "call_module":
             continue
