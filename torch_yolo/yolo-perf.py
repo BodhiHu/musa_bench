@@ -242,9 +242,9 @@ def benchmark(
                 traceable_clszs.add(type(module))
             except Exception as exc:
                 untraceable_clszs.add(type(module))
-                pass
+
             if args.print_layers:
-                print(f"{name:<30} :: {str(type(module)):<50} | is_traceable {'✔ ' if is_traceable else '❌'} |")
+                print(f"{name:<40} :: {str(type(module)):<50} | is_traceable {'✔ ' if is_traceable else '❌'} |")
 
         print("\ntraceable_clszs =\n"   + '\n'.join(str(item) for item in traceable_clszs))
         print("\nuntraceable_clszs =\n" + '\n'.join(str(item) for item in untraceable_clszs))
@@ -470,7 +470,7 @@ def benchmark(
             if print_layers:
                 print("")
                 for name, module in model.model.named_modules():
-                    print(f"{name:<30} :: {type(module)}")
+                    print(f"{name:<40} :: {type(module)}")
                 print("")
 
             quanzied_model_file = f"{model.model_name.replace('.pt', '')}-{dtype}-{quant_method}.pth"

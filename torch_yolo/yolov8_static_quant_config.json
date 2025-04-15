@@ -8,7 +8,7 @@
             "activation", "weight"
         ],
         "op_types": [
-            "conv_silu_2d"
+            "conv_silu_2d", "conv"
         ],
         "observers": {
             "weight": {
