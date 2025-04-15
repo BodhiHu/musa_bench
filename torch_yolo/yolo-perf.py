@@ -116,8 +116,8 @@ def parse_args():
     parser.add_argument("-ng", "--no-graph", action="store_true", help="turn off cuda/musa graph.")
     parser.add_argument("--rounds", default=DEFAULT_ROUNDS, type=int, help="rounds to run")
     parser.add_argument("-p", "--profiling", action="store_true", help="turn on perf profiling mode.")
-    parser.add_argument("-pm", "--print_model", action="store_true", help="print model info.")
-    parser.add_argument("-pp", "--print_layers", action="store_true", help="print model layers.")
+    parser.add_argument("-pm", "--print-model", action="store_true", help="print model info.")
+    parser.add_argument("-pp", "--print-layers", action="store_true", help="print model layers.")
 
     args = parser.parse_args()
 
@@ -126,7 +126,7 @@ def parse_args():
         TRITON_TOGGLES.append(False)
     if args.no_compile:
         TRITON_TOGGLES = [False]
-    
+
     global GRAPH_TOGGLES
     if args.no_graph:
         GRAPH_TOGGLES = [False]
