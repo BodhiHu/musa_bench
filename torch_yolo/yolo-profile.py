@@ -1,6 +1,11 @@
+import os, sys
+current_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(current_dir)
+sys.path.append(os.path.abspath(f"{current_dir}/.."))
+sys.path.append(os.path.abspath(f"{current_dir}/../.."))
+
 import argparse
 from datetime import datetime
-import os
 import re
 from ultralytics import YOLO
 import torch
@@ -33,6 +38,7 @@ if __name__ == "__main__":
         model.model = torch.compile(model.model, backend="inductor", mode="default")
 
     # warmup model
+    print("INFO: warming up model ...")
     for i in range(10):
         results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
 
@@ -42,7 +48,6 @@ if __name__ == "__main__":
 
     if args.profiler == "plain":
         print("INFO: using plain profiler")
-        print("INFO: using chrome_trace profiler")
         trace_file_name = f"profiler-trace-{device_name}-{current_ts}.json"
 
         with torch.profiler.profile(
@@ -61,6 +66,7 @@ if __name__ == "__main__":
             for i in range(rounds):
                 results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
         print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=100))
+        print(f"INFO: saved chrome_trace to {trace_file_name}")
         prof.export_chrome_trace(trace_file_name)
     elif args.profiler == "autograd":
         print("INFO: using autograd profiler")
@@ -77,3 +83,4 @@ if __name__ == "__main__":
             for i in range(rounds):
                 results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
         prof.export_chrome_trace(trace_file_name)
+        print(f"INFO: saved chrome_trace to {trace_file_name}")
