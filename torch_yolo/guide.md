@@ -44,6 +44,7 @@ Install yolo pip package:
 pip install setuptools wheel build
 git clone git@sh-code.mthreads.com:m1000-sw/ultralytics.git
 cd ultralytics
+git checkout v8.3.96/musa
 python -m build --wheel
 pip install dist/<biult-whl-pkg>
 ```
