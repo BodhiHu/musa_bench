@@ -253,7 +253,10 @@ def benchmark(
         return (traceable_clszs, untraceable_clszs)
 
     def may_compile_and_quant(model: YOLO):
-        # fuse conv2d and bn
+        print_mod = args.print_model
+        print_layers = args.print_layers
+
+        # fuse the manual fusable layers first
         model.fuse()
 
         if triton:
@@ -282,8 +285,6 @@ def benchmark(
             backend = "qnnpack"
             input_tensor = np.load('img_0.npy')
             input_tensor = torch.from_numpy(input_tensor)
-            print_mod = args.print_model
-            print_layers = args.print_layers
 
             _model = model.model
 
