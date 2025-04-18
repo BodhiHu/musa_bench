@@ -95,7 +95,7 @@ COMPILE_MODES = [
     "max-autotune",
     "max-autotune-no-cudagraphs",
 ]
-DEFAULT_ROUNDS = 30
+DEFAULT_ROUNDS = 3
 CWD = os.path.dirname(os.path.abspath(__file__))
 DEVICE_NAME = get_device_name()
 
@@ -411,7 +411,6 @@ def benchmark(
                 if hasattr(_model, "stride"):
                     model_quantized.stride = _model.stride
                 model_quantized.names = _model.module.names if hasattr(_model, "module") else _model.names
-                model.model = model_quantized.half()
 
             if quant_method == "neuro-fx":
                 from neurotrim.compression.config import Config
@@ -477,6 +476,7 @@ def benchmark(
             quanzied_model_file = f"{model.model_name.replace('.pt', '')}-{dtype}-{quant_method}.pth"
             if os.path.exists(quanzied_model_file):
                 os.remove(quanzied_model_file)
+            model.model = model.model.half()
             torch.save(model.model, quanzied_model_file)
             print(f"INFO: saved quantized model({type(model.model)}) to {quanzied_model_file}, size = {os.path.getsize(quanzied_model_file) / (1024**2):.2f}MB")
             model.model.to(device).eval()
@@ -526,7 +526,7 @@ def benchmark(
                 rounds = 1
 
             def rounds_predict(warmup = False):
-                _rounds = rounds if not warmup else 10
+                _rounds = rounds if not warmup else 3
                 print("INFO: rounds =", _rounds)
                 for _ in range(_rounds):
                     exported_model.predict(
@@ -636,7 +636,7 @@ def main(models: List[str],
         print_table_head(bf)
         for dtype, model, batch, triton, graph_on in product(dtypes, models, batches, TRITON_TOGGLES, GRAPH_TOGGLES):
             int8 = dtype == "int8"
-            half = dtype == "fp16"
+            half = dtype == "fp16" or int8
 
             def _benchmark(warmup=False, compile_mode=None):
                 benchmark(
