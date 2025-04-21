@@ -110,7 +110,7 @@ def parse_args():
     parser.add_argument("--qmethod", default="neuro-fx", type=str, help="quant method (dynamic, static, fx, neuro-fx)")
     parser.add_argument("--cmp-modes", default=COMPILE_MODES, type=lambda s: s.split(","), help="compile modes")
     parser.add_argument("-tt", "--triton-toggles", action="store_true", help="If also perf without triton.")
-    parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
+    parser.add_argument("-nc", "--no-compile", action="store_true", help="trun off compiling.")
     parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
     parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env.")
     parser.add_argument("-ng", "--no-musa-graph", action="store_true", help="turn off musa graph.")
@@ -534,10 +534,11 @@ def benchmark(
                         use_graph=use_graph
                     )
 
-            if warmup:
+            if warmup or profiling:
                 print("INFO: warming up model ...")
                 rounds_predict()
-                return
+                if not profiling:
+                    return
 
             current_ts = datetime.now().strftime("%Y%m%d-%H%M")
             if profiling:
@@ -553,7 +554,7 @@ def benchmark(
                     with_stack=True,
                     with_flops=True,
                     with_modules=True,
-                    use_musa=True
+                    # use_musa=True
                 ) as prof:
                     rounds_predict(1)
                 print(prof.key_averages().table(sort_by="self_musa_time_total", row_limit=100))

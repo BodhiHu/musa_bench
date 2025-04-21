@@ -20,7 +20,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Profile yolo model")
     parser.add_argument("--dtype",      default="fp16", type=str, help="dtype (e.g. int8|fp16|fp32)")
-    parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
+    parser.add_argument("-nc", "--no-compile", action="store_true", help="trun off compiling.")
     parser.add_argument("--profiler",   default="plain", type=str, help="use plain or autograd profiler")
     parser.add_argument("--graph",      action="store_true", help="turn on musa graph")
     parser.add_argument("--rounds",     default=1, type=int, help="rounds to profiles")
@@ -30,6 +30,7 @@ if __name__ == "__main__":
 
     model = YOLO('yolov8m.pt').to('cuda')
     model.model.to('musa').eval()
+    model.fuse()
 
     print(f"INFO: using half: {half}")
 
@@ -61,7 +62,7 @@ if __name__ == "__main__":
             with_stack=True,
             with_flops=True,
             with_modules=True,
-            use_musa=True
+            # use_musa=True
         ) as prof:
             for i in range(rounds):
                 results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
