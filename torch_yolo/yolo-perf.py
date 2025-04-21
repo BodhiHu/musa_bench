@@ -95,7 +95,7 @@ COMPILE_MODES = [
     "max-autotune",
     "max-autotune-no-cudagraphs",
 ]
-DEFAULT_ROUNDS = 3
+DEFAULT_ROUNDS = 10
 CWD = os.path.dirname(os.path.abspath(__file__))
 DEVICE_NAME = get_device_name()
 
@@ -113,7 +113,8 @@ def parse_args():
     parser.add_argument("--no-compile", action="store_true", help="trun off compiling.")
     parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
     parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env.")
-    parser.add_argument("-ng", "--no-graph", action="store_true", help="turn off cuda/musa graph.")
+    parser.add_argument("-ng", "--no-musa-graph", action="store_true", help="turn off musa graph.")
+    parser.add_argument("--fullgraph", action="store_true", help="turn on torch.compile fullgraph.")
     parser.add_argument("--rounds", default=DEFAULT_ROUNDS, type=int, help="rounds to run")
     parser.add_argument("-p", "--profiling", action="store_true", help="turn on perf profiling mode.")
     parser.add_argument("-pm", "--print-model", action="store_true", help="print model info.")
@@ -128,7 +129,7 @@ def parse_args():
         TRITON_TOGGLES = [False]
 
     global GRAPH_TOGGLES
-    if args.no_graph:
+    if args.no_musa_graph:
         GRAPH_TOGGLES = [False]
 
     return args
@@ -269,7 +270,8 @@ def benchmark(
             model.model = torch.compile(
                 model.model,
                 backend="inductor",
-                mode=compile_mode
+                mode=compile_mode,
+                fullgraph=args.fullgraph
             )
             # if warmup:
             #     input_tensor = np.load('img_0.npy')
@@ -500,7 +502,7 @@ def benchmark(
 
             if format == "-":
                 filename = model.pt_path or model.ckpt_path or model.model_name
-                exported_model = model  # PyTorch format
+                exported_model: YOLO = model  # PyTorch format
             elif format == 'torchscript':
                 print(f"INFO: export model to torchscript")
                 filename = model.export(
@@ -519,15 +521,12 @@ def benchmark(
 
             emoji = "❎"  # indicates export succeeded
 
-            print(f"INFO: format = {format}, use_graph = {use_graph}, batch = {batch}, triton = {compile_mode if triton else triton}, dtype = {dtype}, half={half}, int8={int8}")
+            print(f"INFO: format = {format}, use_graph = {use_graph}, batch = {batch}, triton = {compile_mode if triton else triton}, fx-fullgraph = {args.fullgraph}, dtype = {dtype}, half={half}, int8={int8}")
 
             rounds = args.rounds
-            if profiling:
-                rounds = 1
 
-            def rounds_predict(warmup = False):
-                _rounds = rounds if not warmup else 3
-                print("INFO: rounds =", _rounds)
+            def rounds_predict(_rounds = rounds):
+                print("INFO: predict rounds =", _rounds)
                 for _ in range(_rounds):
                     exported_model.predict(
                         ASSETS / "bus.jpg",
@@ -537,7 +536,7 @@ def benchmark(
 
             if warmup:
                 print("INFO: warming up model ...")
-                rounds_predict(warmup=True)
+                rounds_predict()
                 return
 
             current_ts = datetime.now().strftime("%Y%m%d-%H%M")
@@ -556,7 +555,7 @@ def benchmark(
                     with_modules=True,
                     use_musa=True
                 ) as prof:
-                    rounds_predict()
+                    rounds_predict(1)
                 print(prof.key_averages().table(sort_by="self_musa_time_total", row_limit=100))
                 trace_file_name = f"perf-trace-{DEVICE_NAME}-{current_ts}.json"
                 prof.export_chrome_trace(trace_file_name)
