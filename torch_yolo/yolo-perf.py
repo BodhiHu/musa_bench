@@ -574,6 +574,7 @@ def benchmark(
             # Validate
             results = exported_model.val(
                 data=data, batch=batch, imgsz=imgsz, device=device, half=half, int8=int8,
+                use_graph=use_graph,
                 plots=False, verbose=False
             )
             # results.

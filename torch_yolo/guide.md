@@ -83,3 +83,9 @@ results[0].show()
 ### Sample code (yolo-perf.py)
 
 You can just run `python yolo-perf.py` to perf benchmarks.
+
+## perf with msys
+You need to first figure out the **--delay**:
+``` bash
+msys profile --delay 32 python yolo-msys-profile.py --graph
+```
