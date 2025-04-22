@@ -521,18 +521,25 @@ def benchmark(
 
             emoji = "❎"  # indicates export succeeded
 
+            print(f"\n========= bench ==========================================================================================\n")
             print(f"INFO: format = {format}, use_graph = {use_graph}, batch = {batch}, triton = {compile_mode if triton else triton}, fx-fullgraph = {args.fullgraph}, dtype = {dtype}, half={half}, int8={int8}")
 
             rounds = args.rounds
 
             def rounds_predict(_rounds = rounds):
                 print("INFO: predict rounds =", _rounds)
-                for _ in range(_rounds):
-                    exported_model.predict(
+                results = []
+                for i in range(_rounds):
+                    fully_warmedup = _rounds > 2 and i >= 2
+                    res = exported_model.predict(
                         ASSETS / "bus.jpg",
-                        imgsz=imgsz, device=device, half=half, int8=int8, verbose=False,
-                        use_graph=use_graph
+                        imgsz=imgsz, device=device, half=half, int8=int8,
+                        use_graph=use_graph,
+                        verbose=True
                     )
+                    if fully_warmedup:
+                        results.append(res)
+                return results
 
             if warmup or profiling:
                 print("INFO: warming up model ...")
@@ -566,8 +573,10 @@ def benchmark(
 
             # Validate
             results = exported_model.val(
-                data=data, batch=batch, imgsz=imgsz, plots=False, device=device, half=half, int8=int8, verbose=False
+                data=data, batch=batch, imgsz=imgsz, device=device, half=half, int8=int8,
+                plots=False, verbose=False
             )
+            # results.
             metric, speed = results.results_dict[key], results.speed["inference"]
             fps = round(1000 / (speed + eps), 2)  # frames per second
             y.append([name, "✅", round(file_size(filename), 1), round(metric, 4), round(speed, 2), fps])

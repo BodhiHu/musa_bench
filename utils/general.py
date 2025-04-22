@@ -1135,14 +1135,17 @@ def colorstr(*input):
 
 
 def get_device_name():
-    # Run musaInfo and capture output
-    result = subprocess.run(["musaInfo"], capture_output=True, text=True)
-    output = result.stdout
+    try:
+        # Run musaInfo and capture output
+        result = subprocess.run(["musaInfo"], capture_output=True, text=True)
+        output = result.stdout
 
-    # Find the Name line
-    match = re.search(r"Name:\s+(.*)", output)
-    if match:
-        name = match.group(1).strip().replace("MTT ", "")
-        return name
+        # Find the Name line
+        match = re.search(r"Name:\s+(.*)", output)
+        if match:
+            name = match.group(1).strip().replace("MTT ", "")
+            return name
+    except:
+        print("WARN: exception when getting gpu device name")
     return "unknown"
 

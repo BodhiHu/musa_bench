@@ -27,12 +27,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     half = args.dtype == "fp16"
+    device_name = get_device_name()
 
     model = YOLO('yolov8m.pt').to('cuda')
     model.model.to('musa').eval()
     model.fuse()
 
-    print(f"INFO: using half: {half}")
+    print(f"INFO: using half: {half}, device = {device_name}")
 
     if not args.no_compile:
         print("INFO: compiling model ...")
@@ -44,7 +45,6 @@ if __name__ == "__main__":
         results = model.predict('images/bus.jpg', half=half, use_graph=args.graph)
 
     current_ts = datetime.now().strftime("%Y%m%d-%H%M")
-    device_name = get_device_name()
     rounds = args.rounds or 1
 
     if args.profiler == "plain":

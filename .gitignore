@@ -6,3 +6,4 @@ datasets/
 *log*.txt
 *.pt
 *.pth
+*.msys-rep
