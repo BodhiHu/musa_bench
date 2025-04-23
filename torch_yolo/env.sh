@@ -4,6 +4,7 @@ ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export PYTHONPATH="$ENV_DIR/../../ultralytics:$PYTHONPATH"
 export PYTHONPATH="$ENV_DIR/../../NeuroTrim:$PYTHONPATH"
+# export LD_LIBRARY_PATH=/home/bodhi/bodhi/tmp/msys:$LD_LIBRARY_PATH
 
 export ENABLE_MUSA_MMA=1
 

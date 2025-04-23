@@ -17,6 +17,7 @@ import logging
 import platform
 import torch
 import torch_musa
+import torch._dynamo
 from torch import fx
 from tqdm import tqdm
 from datetime import datetime
@@ -114,7 +115,7 @@ def parse_args():
     parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
     parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env.")
     parser.add_argument("-ng", "--no-musa-graph", action="store_true", help="turn off musa graph.")
-    parser.add_argument("--fullgraph", action="store_true", help="turn on torch.compile fullgraph.")
+    parser.add_argument("-fg", "--fullgraph", action="store_true", help="turn on torch.compile fullgraph.")
     parser.add_argument("--rounds", default=DEFAULT_ROUNDS, type=int, help="rounds to run")
     parser.add_argument("-p", "--profiling", action="store_true", help="turn on perf profiling mode.")
     parser.add_argument("-pm", "--print-model", action="store_true", help="print model info.")
@@ -260,12 +261,20 @@ def benchmark(
         # fuse the manual fusable layers first
         model.fuse()
 
+        model.model.to(device)
+        input_tensor = np.load('img_0.npy')
+        input_tensor = torch.from_numpy(input_tensor).to("cuda")
+        with torch.no_grad():
+            model.model(input_tensor)
+
         if triton:
             if type(model.model) == str:
                 print(f"WARN: will not call compile for model.model of type = {type(model.model)}")
                 return
 
             print(f"INFO: compile model {type(model.model)} on {device}, mode = {compile_mode}")
+            # suppress dynomo errors and fallback to eager mode
+            torch._dynamo.config.suppress_errors = True
             model.model.to(device).eval()
             model.model = torch.compile(
                 model.model,
@@ -273,11 +282,13 @@ def benchmark(
                 mode=compile_mode,
                 fullgraph=args.fullgraph
             )
-            # if warmup:
-            #     input_tensor = np.load('img_0.npy')
-            #     input_tensor = torch.from_numpy(input_tensor).to("cuda")
-            #     with torch.no_grad():
-            #         model.model(input_tensor)
+
+            # warmup the fresly compiled model to trigger the actual "compile":
+            for _ in range(3):
+                input_tensor = np.load('img_0.npy')
+                input_tensor = torch.from_numpy(input_tensor).to("cuda")
+                with torch.no_grad():
+                    model.model(input_tensor)
 
         quant_method = args.qmethod
         if dtype == "int8":
