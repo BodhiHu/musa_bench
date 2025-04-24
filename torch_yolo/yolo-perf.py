@@ -50,6 +50,9 @@ except Exception as exc:
     torch.cuda = torch.musa
     torch.cuda.CUDAGraph = torch.musa.MUSAGraph
 
+FILE_PATH = Path(__file__).resolve()
+FILE_DIR = FILE_PATH.parent
+IMAGES_PATH = FILE_DIR / "images"
 
 DEFAULT_MODELS = [
     #"yolov5n.pt",
@@ -99,6 +102,13 @@ COMPILE_MODES = [
 DEFAULT_ROUNDS = 10
 CWD = os.path.dirname(os.path.abspath(__file__))
 DEVICE_NAME = get_device_name()
+
+SAMPLING_IMAGES = [
+    IMAGES_PATH / "巴士 - 810x1080.jpg",
+    IMAGES_PATH / "行者 - 1920x1280.jpg",
+    IMAGES_PATH / "行者 - 1920x1080.jpg",
+    IMAGES_PATH / "行者 - 1080x1080.jpg",
+]
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run YOLO benchmarks.")
@@ -205,6 +215,7 @@ def benchmark(
     model,
     data=None,
     imgsz=160,
+    image: Path = SAMPLING_IMAGES[0],
     batch=1,
     half=False,
     int8=False,
@@ -541,9 +552,9 @@ def benchmark(
                 print("INFO: predict rounds =", _rounds)
                 results = []
                 for i in range(_rounds):
-                    fully_warmedup = _rounds > 2 and i >= 2
+                    fully_warmedup = i >= 3
                     res = exported_model.predict(
-                        ASSETS / "bus.jpg",
+                        image,
                         imgsz=imgsz, device=device, half=half, int8=int8,
                         use_graph=use_graph,
                         verbose=True
@@ -559,6 +570,7 @@ def benchmark(
                     return
 
             current_ts = datetime.now().strftime("%Y%m%d-%H%M")
+            fps = 0
             if profiling:
                 print(f"INFO: start profiling")
                 with torch.profiler.profile(
@@ -580,7 +592,11 @@ def benchmark(
                 prof.export_chrome_trace(trace_file_name)
                 exit(0)
             else:
-                rounds_predict()
+                results = rounds_predict()
+                sumed = 0
+                for r in results:
+                    sumed += r[0].speed["inference"]
+                fps = round(1000 / (sumed / len(results)), 2)
 
             # Validate
             results = exported_model.val(
@@ -589,9 +605,9 @@ def benchmark(
                 plots=False, verbose=False
             )
             # results.
-            metric, speed = results.results_dict[key], results.speed["inference"]
-            fps = round(1000 / (speed + eps), 2)  # frames per second
-            y.append([name, "✅", round(file_size(filename), 1), round(metric, 4), round(speed, 2), fps])
+            metric, val_speed = results.results_dict[key], results.speed["inference"]
+            # fps = round(1000 / (speed + eps), 2)  # frames per second
+            y.append([name, "✅", round(file_size(filename), 1), round(metric, 4), round(val_speed, 2), fps])
         except Exception as e:
             print(f"Benchmark failure for {name}: {e}")
             traceback.print_exc()
@@ -606,7 +622,7 @@ def benchmark(
     dt = time.time() - t0
 
     row = y[0]
-    print_table_row(bf, model_name, row[2], use_graph, dtype, batch, data, imgsz, triton, compile_mode, row[3], row[4], row[5])
+    print_table_row(bf, model_name, row[2], use_graph, dtype, batch, data, imgsz, image.name, triton, compile_mode, row[3], row[4], row[5])
 
     legend = "Benchmarks legend:  - ✅ Success  - ❎ Export passed but validation failed  - ❌️ Export failed"
     s = f"\nBenchmarks complete for {name} on {data} at imgsz={imgsz} ({dt:.2f}s)\n{legend}\n{df.fillna('-')}\n"
@@ -630,13 +646,13 @@ tr:nth-child(even) { background-color: rgba(99,99,99,0.3); }
 </style>
 
 """)
-    bf.write(f"| Model       | Size      | dtype    | batch   | dataset          | imgsz           | graph    | compile(triton)  | mAP50-95(B)      | ms/im            | FPS              |\n")
-    bf.write(f"| :---------: | :-------: | :------: | :-----: | :--------------: | :--------------:| :------: | :--------------: | :--------------: | :--------------: | :--------------: |\n")
+    bf.write(f"| Model       | Size      | dtype    | batch   | dataset          | imgsz           | image           | graph    | compile(triton)  | mAP50-95(B)      | ms/im            | FPS              |\n")
+    bf.write(f"| :---------: | :-------: | :------: | :-----: | :--------------: | :--------------:| :--------------:| :------: | :--------------: | :--------------: | :--------------: | :--------------: |\n")
     bf.flush()
 
-def print_table_row(bf, model, size, graph, dtype, batch, dataset, imgsz, triton, compile_mode, metrics_mAP50, ms_per_img, fps):
+def print_table_row(bf, model, size, graph, dtype, batch, dataset, imgsz, image, triton, compile_mode, metrics_mAP50, ms_per_img, fps):
     triton_mode = compile_mode if triton else triton
-    bf.write(f"| {model:<12}| {size:<10}| {dtype:<9}| {batch:<8}| {dataset:<17}| {imgsz:<17}| {graph:<9}| {(triton_mode):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
+    bf.write(f"| {model:<12}| {size:<10}| {dtype:<9}| {batch:<8}| {dataset:<17}| {imgsz:<17}| {image:<17} | {graph:<9}| {(triton_mode):<17}| {metrics_mAP50:<17}| {ms_per_img:<17}| {fps:<17}|\n")
     bf.flush()
 
 
@@ -660,11 +676,13 @@ def main(models: List[str],
             half = dtype == "fp16" or int8
 
             def _benchmark(warmup=False, compile_mode=None):
-                benchmark(
-                    bf=bf, model=model, data=dataset, imgsz=imgsz, batch=batch,
-                    half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode,
-                    warmup=warmup, profiling=profiling, use_graph=graph_on
-                )
+                _sampling_images = SAMPLING_IMAGES if not warmup else [SAMPLING_IMAGES[0]]
+                for image in _sampling_images:
+                    benchmark(
+                        bf=bf, model=model, data=dataset, imgsz=imgsz, image=image, batch=batch,
+                        half=half, int8=int8, dtype=dtype, device=device, triton=triton, compile_mode=compile_mode,
+                        warmup=warmup, profiling=profiling, use_graph=graph_on
+                    )
 
             if triton:
                 print("INFO: torch compile warming up...")
