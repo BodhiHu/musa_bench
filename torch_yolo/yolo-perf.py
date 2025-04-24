@@ -89,8 +89,8 @@ DEFAULT_DTYPES = [
     "fp16",
     # "int8"
 ]
-TRITON_TOGGLES = [True]
-GRAPH_TOGGLES = [True, False]
+TRITON_TOGGLES = [False, True]
+GRAPH_TOGGLES  = [False, True]
 DEFAULT_DEVICE = "cuda:0"
 # DEFAULT_DEVICE = "musa:0"
 COMPILE_MODES = [
@@ -120,7 +120,6 @@ def parse_args():
     parser.add_argument("--dtypes", default=DEFAULT_DTYPES, type=lambda s: s.split(","), help="dtypes (e.g. int8,fp16,fp32)")
     parser.add_argument("--qmethod", default="neuro-fx", type=str, help="quant method (dynamic, static, fx, neuro-fx)")
     parser.add_argument("--cmp-modes", default=COMPILE_MODES, type=lambda s: s.split(","), help="compile modes")
-    parser.add_argument("-tt", "--triton-toggles", action="store_true", help="If also perf without triton.")
     parser.add_argument("-nc", "--no-compile", action="store_true", help="trun off compiling.")
     parser.add_argument("-d", "--debug", action="store_true", help="turn on debug mode.")
     parser.add_argument("-v", "--verify-musa", action="store_true", help="verify musa env.")
@@ -134,8 +133,6 @@ def parse_args():
     args = parser.parse_args()
 
     global TRITON_TOGGLES
-    if args.triton_toggles:
-        TRITON_TOGGLES.append(False)
     if args.no_compile:
         TRITON_TOGGLES = [False]
 
@@ -557,6 +554,8 @@ def benchmark(
                         image,
                         imgsz=imgsz, device=device, half=half, int8=int8,
                         use_graph=use_graph,
+                        preprocess_device="cpu",
+                        postprocess_device="cpu",
                         verbose=True
                     )
                     if fully_warmedup:
@@ -570,6 +569,7 @@ def benchmark(
                     return
 
             current_ts = datetime.now().strftime("%Y%m%d-%H%M")
+            speed = 0
             fps = 0
             if profiling:
                 print(f"INFO: start profiling")
@@ -596,18 +596,19 @@ def benchmark(
                 sumed = 0
                 for r in results:
                     sumed += r[0].speed["inference"]
-                fps = round(1000 / (sumed / len(results)), 2)
+                speed = sumed / len(results)
+                fps = round(1000 / speed, 2)
 
             # Validate
             results = exported_model.val(
                 data=data, batch=batch, imgsz=imgsz, device=device, half=half, int8=int8,
                 use_graph=use_graph,
-                plots=False, verbose=False
+                plots=True, verbose=False
             )
             # results.
             metric, val_speed = results.results_dict[key], results.speed["inference"]
             # fps = round(1000 / (speed + eps), 2)  # frames per second
-            y.append([name, "✅", round(file_size(filename), 1), round(metric, 4), round(val_speed, 2), fps])
+            y.append([name, "✅", round(file_size(filename), 1), round(metric, 4), round(speed, 2), fps])
         except Exception as e:
             print(f"Benchmark failure for {name}: {e}")
             traceback.print_exc()
