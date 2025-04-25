@@ -647,8 +647,8 @@ tr:nth-child(even) { background-color: rgba(99,99,99,0.3); }
 </style>
 
 """)
-    bf.write(f"| Model       | Size      | dtype    | batch   | dataset          | imgsz           | image           | graph    | compile(triton)  | mAP50-95(B)      | ms/im            | FPS              |\n")
-    bf.write(f"| :---------: | :-------: | :------: | :-----: | :--------------: | :--------------:| :--------------:| :------: | :--------------: | :--------------: | :--------------: | :--------------: |\n")
+    bf.write(f"| Model       | Size      | dtype    | batch   | dataset          | imgsz           | image          | graph    | compile(triton)  | mAP50-95(B)      | ms/im            | FPS              |\n")
+    bf.write(f"| :---------: | :-------: | :------: | :-----: | :--------------: | :--------------:| :--------------| :------: | :--------------: | :--------------: | :--------------: | :--------------: |\n")
     bf.flush()
 
 def print_table_row(bf, model, size, graph, dtype, batch, dataset, imgsz, image, triton, compile_mode, metrics_mAP50, ms_per_img, fps):
