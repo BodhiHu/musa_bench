@@ -1,8 +1,10 @@
 import argparse
+import time
 import torch
 import torch_musa
 import torch_musa.cuda_compat
 import cv2
+import os
 import requests
 import numpy as np
 import uvicorn
@@ -14,18 +16,23 @@ from screeninfo import get_monitors
 import threading
 
 
-STREAM_URL = "http://192.168.164.136:8686/video"
+DEFAULT_STREAM_URL = "http://192.168.164.136:8686/video"
+STREAM_URL = os.getenv("STREAM_URL", DEFAULT_STREAM_URL)
+VERBOSE    = bool(os.getenv("VERBOSE", False))
 device = "musa:0"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run YOLO detector services")
     parser.add_argument("--live-on-local", action="store_true")
-    parser.add_argument("--port", type=int, default=8686)
+    parser.add_argument("--port", type=int, default=8866)
     parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
+    parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
 args = parse_args()
+if args.verbose:
+    VERBOSE = True
 
 
 def get_cv_wind_size():
@@ -125,21 +132,44 @@ app = FastAPI()
 lock = threading.Lock()
 
 def yolo_detect_frames():
+    prev_time = None
+    fps = 0
+    pre_endtime = None
+
     for frame in mjpeg_stream_reader():
         if frame is None:
             continue
 
+        if VERBOSE and pre_endtime:
+            print(f"jpeg read time: {((time.time() - pre_endtime)*1000):.2f}ms")
+
         # Run YOLO object detection
+        pred_start = time.time()
         results = model.predict(
             frame, imgsz=args.imgsz, half=True,
             use_graph=False,
             preprocess_device="cpu",
             postprocess_device="cpu",
-            verbose=True
+            verbose=VERBOSE
         )
+        pred_end = time.time()
+        pred_time = pred_end - pred_start
+        fps = 1 / pred_time
 
+        plot_time = time.time()
         # Draw results on frame
         annotated_frame = results[0].plot()
+
+        if VERBOSE:
+            cur_time = time.time()
+            total_time = 0
+            if prev_time is not None:
+                total_time = cur_time - prev_time
+            prev_time = cur_time
+            print(f"fps = {fps:.2f}, model time = {(pred_time*1000):.2f}ms, time = {(total_time * 1000):.2f}ms")
+
+        cv2.putText(annotated_frame, f"FPS: {fps:.2f}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
         # Encode to JPEG
         ret, jpeg = cv2.imencode('.jpg', annotated_frame)
@@ -148,9 +178,14 @@ def yolo_detect_frames():
 
         frame_bytes = jpeg.tobytes()
 
+        if VERBOSE:
+            print(f"plots to jpeg time: {((time.time()-plot_time)*1000):.2f}ms")
+
         # Yield as MJPEG
         yield (b"--frame\r\n"
                b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+
+        pre_endtime = time.time()
 
 
 @app.get("/video")

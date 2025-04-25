@@ -74,7 +74,7 @@ def index():
         <h1>Live Stream View</h1>
     """ + \
         f"""
-        <img src="/video" style="width: {TARGET_WIDTH}px; height: {TARGET_HEIGHT}px;" />
+        <img src="/video" style="max-width: 100%; max-height: 100%;" />
         """ + \
     """
     </body>
