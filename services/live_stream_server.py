@@ -1,16 +1,26 @@
+import argparse
 import time
+import uvicorn
 from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 import cv2
 
-VIDEO_PATH     = "./assets/天津道路行人_30fps.mp4" # use 0 for camera
+VIDEO_PATH     = "./assets/温州道路行人_30fps.mp4" # use 0 for camera
 TARGET_WIDTH   = 1920
 TARGET_HEIGHT  = 1080
 TARGET_FPS     = 30
 FRAME_INTERVAL = 1.0 / TARGET_FPS
-JPEG_QUALITY   = 50  # Lower = more compression, 30–60 recommended for streaming
+JPEG_QUALITY   = 60  # Lower = more compression, 30–60 recommended for streaming
 
 encode_param   = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run YOLO detector services")
+    parser.add_argument("--port", type=int, default=8686)
+    return parser.parse_args()
+
+args = parse_args()
+
 
 def generate_frames():
     # can be video path or camera index
@@ -73,3 +83,6 @@ def index():
 
     return ret
 
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=args.port, reload=False)
