@@ -8,7 +8,7 @@ import os
 import requests
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
@@ -87,7 +87,7 @@ def live_yolo_detect_stream(model: YOLO, loop = False, pos = [0, 0], idx = 0):
                 use_graph=False,
                 preprocess_device="cpu",
                 postprocess_device="cpu",
-                verbose=True
+                verbose=VERBOSE
             )
 
             # Draw results on frame
@@ -143,16 +143,24 @@ def yolo_detect_frames():
         if VERBOSE and pre_endtime:
             print(f"jpeg read time: {((time.time() - pre_endtime)*1000):.2f}ms")
 
-        # Run YOLO object detection
-        pred_start = time.time()
-        results = model.predict(
-            frame, imgsz=args.imgsz, half=True,
-            use_graph=False,
-            preprocess_device="cpu",
-            postprocess_device="cpu",
-            verbose=VERBOSE
-        )
-        pred_end = time.time()
+        kwargs = {
+            "imgsz"              : args.imgsz,
+            "half"               : True,
+            "use_graph"          : False,
+            "preprocess_device"  : "cpu",
+            "postprocess_device" : "cpu",
+            "verbose"            : VERBOSE
+        }
+
+        phase_input = None
+        phase_input = model.predict(frame, **kwargs, phase_input=phase_input, phase='preprocess')
+
+        pred_start  = time.time()
+        phase_input = model.predict(frame, **kwargs, phase_input=phase_input, phase='inference')
+        pred_end    = time.time()
+
+        results     = model.predict(frame, **kwargs, phase_input=phase_input, phase='postprocess')
+
         pred_time = pred_end - pred_start
         fps = 1 / pred_time
 
@@ -188,22 +196,57 @@ def yolo_detect_frames():
         pre_endtime = time.time()
 
 
-@app.get("/video")
-def video_feed():
+@app.get("/video/{index}")
+def video_feed(index: int = 0):
     return StreamingResponse(yolo_detect_frames(), media_type='multipart/x-mixed-replace; boundary=frame')
 
-
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(streams: int = Query(1)):
     return """
     <html>
     <head>
         <title>YOLO Live</title>
+        <style>
+            .live-videos {
+                width: 100%;
+                display: flex;
+                flex-direction: row;
+                justify-content: flex-start;
+                align-items: flex-start;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            .live-videos img {
+                max-width: calc(50% - 8px);
+            }
+        </style>
+    """ + \
+    f"""
+        <script>
+            var streams = {streams};
+        </script>
+    """ + \
+    """
     </head>
     <body style="text-align:center;">
         <h2 style="">YOLO Live</h2>
-        <img src="/video" style="max-width: 100%; max-height: 100%;"/>
+        <div class="live-videos">
+            <img src="/video/0" />
+        </div>
     </body>
+    <script>
+        let img0 = document.querySelector('.live-videos > img')
+        let new_img = img0.cloneNode()
+        img0.onload = function() {
+            for (let i = 1; i < streams; i++) {
+                setTimeout(() => {
+                    img = new_img.cloneNode()
+                    img.src = `/video/${i}`
+                    img0.parentElement.insertBefore(img, img0)
+                }, 3000 * i);
+            }
+        }
+    </script>
     </html>
     """
 
