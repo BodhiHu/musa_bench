@@ -1,5 +1,8 @@
 import argparse
+from enum import Enum
+import queue
 import time
+from typing import Dict
 import torch
 import torch_musa
 import torch_musa.cuda_compat
@@ -10,6 +13,7 @@ import numpy as np
 import uvicorn
 from fastapi import FastAPI, Response, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 from screeninfo import get_monitors
@@ -129,9 +133,154 @@ def yolo_detect_video(model: YOLO):
 
 model = init_model()
 app = FastAPI()
-lock = threading.Lock()
 
-def yolo_detect_frames():
+stop_event = threading.Event()
+
+def put_to_queue(tag: str, queue: queue.Queue, data):
+    try:
+        if queue.full():
+            # print(f"WARNING: [{tag}] is full, will remove and skip the first frame in queue")
+            try:
+                queue.get_nowait()
+            except:
+                pass
+
+        queue.put(data, block=False)
+    except Exception as exc:
+        print(f"WARNING: [{tag}] put to queue faield, ignoring:", exc)
+
+
+class QueuedStream:
+    next_stream_idx = 0
+
+    def __init__(self):
+        self.idx                 = QueuedStream.next_stream_idx
+        self.stream_reader       = mjpeg_stream_reader()
+        self.inference_queue     = queue.Queue(maxsize=30)
+        self.model_output_queue  = queue.Queue(maxsize=30)
+        self.output_queue        = queue.Queue(maxsize=30)
+        self.stop_event          = threading.Event()
+
+        QueuedStream.next_stream_idx += 1
+
+        print(f"INFO: created new stream = {self.idx}")
+
+
+model_kwargs = {
+    "imgsz"              : args.imgsz,
+    "half"               : True,
+    "use_graph"          : False,
+    "preprocess_device"  : "cpu",
+    "postprocess_device" : "cpu",
+    "verbose"            : VERBOSE
+}
+
+streams: Dict[int, QueuedStream] = {}
+streams_lock = threading.Lock()
+
+def add_stream():
+    with streams_lock:
+        stream = QueuedStream()
+        streams[stream.idx] = stream
+
+    print(f"INFO: added new stream: {stream.idx}")
+    return stream
+
+def remove_stream(stream_id: int):
+    with streams_lock:
+        if stream_id in streams:
+            streams[stream_id].stop_event.set()
+            del streams[stream_id]
+
+    print(f"INFO: removed stream: {stream_id}")
+
+def yolo_preprocess_worker():
+    while not stop_event.is_set():
+        with streams_lock:
+            for s_idx, stream in streams.items():
+                frame = next(stream.stream_reader)
+                if frame is None:
+                    continue
+
+                results = model.predict(frame, **model_kwargs, phase='preprocess')
+                data = (frame, results)
+                put_to_queue(f"inference_queue[{s_idx}]", stream.inference_queue, data)
+
+
+def yolo_inference_worker():
+    while not stop_event.is_set():
+        with streams_lock:
+            empty = True
+            for _idx, stream in streams.items():
+                if not stream.inference_queue.empty():
+                    empty = False
+                    break
+            if empty:
+                print("WARN: all stream inference queues are empty, will wait 100ms for new requests")
+                time.sleep(100/1000)
+                continue
+
+            for s_idx, stream in streams.items():
+                try:
+                    (frame, phase_input) = stream.inference_queue.get(block=False)
+                except queue.Empty:
+                    continue
+
+                pred_start  = time.time()
+                results = model.predict(frame, **model_kwargs, phase_input=phase_input, phase='inference')
+                pred_end = time.time()
+                pred_time = pred_end - pred_start
+                fps = 1 / pred_time
+                data = (frame, results, fps)
+                put_to_queue(f"model_output_queue[{s_idx}]", stream.model_output_queue, data)
+
+
+def yolo_postprocess_worker():
+    while not stop_event.is_set():
+        with streams_lock:
+            empty = True
+            for _idx, stream in streams.items():
+                if not stream.model_output_queue.empty():
+                    empty = False
+                    break
+            if empty:
+                # wait 10ms for new frames data
+                time.sleep(10/1000)
+                continue
+
+            for s_idx, stream in streams.items():
+                try:
+                    (frame, phase_input, fps) = stream.model_output_queue.get(block=False)
+                except queue.Empty:
+                    continue
+
+                results = model.predict(frame, **model_kwargs, phase_input=phase_input, phase='postprocess')
+                annotated_frame = results[0].plot()
+                cv2.putText(annotated_frame, f"FPS: {fps:.2f}", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+
+                # Encode to JPEG
+                ret, jpeg = cv2.imencode('.jpg', annotated_frame)
+                if not ret:
+                    continue
+
+                frame_bytes = jpeg.tobytes()
+                put_to_queue(f"output_queue[{s_idx}]", stream.output_queue, frame_bytes)
+
+
+def yolo_pipelined_stream(stream: QueuedStream):
+    while not stop_event.is_set() and not stream.stop_event.is_set():
+        try:
+            frame_bytes = stream.output_queue.get(block=True)
+        except queue.Empty:
+            time.sleep(0.3)
+            continue
+
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+
+
+def yolo_synced_stream():
     prev_time = None
     fps = 0
     pre_endtime = None
@@ -196,12 +345,28 @@ def yolo_detect_frames():
         pre_endtime = time.time()
 
 
-@app.get("/video/{index}")
-def video_feed(index: int = 0):
-    return StreamingResponse(yolo_detect_frames(), media_type='multipart/x-mixed-replace; boundary=frame')
+class YoloLiveMode(str, Enum):
+    sync      = "sync"
+    pipelined = "pipelined"
+
+@app.get("/video/sync/{index}")
+def yolo_sync(index: int = 0):
+    return StreamingResponse(yolo_synced_stream(), media_type='multipart/x-mixed-replace; boundary=frame')
+
+@app.get("/video/pipelined/{index}")
+def yolo_pipelined(index: int = 0):
+    stream = add_stream()
+    res = StreamingResponse(yolo_pipelined_stream(stream), media_type='multipart/x-mixed-replace; boundary=frame')
+
+    async def on_close():
+        remove_stream(stream_id=stream.idx)
+
+    res.background = BackgroundTask(on_close)
+
+    return res
 
 @app.get("/", response_class=HTMLResponse)
-def index(streams: int = Query(1)):
+def index(streams: int = Query(1), mode: YoloLiveMode = Query(YoloLiveMode.pipelined)):
     return """
     <html>
     <head>
@@ -223,6 +388,7 @@ def index(streams: int = Query(1)):
     """ + \
     f"""
         <script>
+            var yolo_mode = {mode}
             var streams = {streams};
         </script>
     """ + \
@@ -231,7 +397,11 @@ def index(streams: int = Query(1)):
     <body style="text-align:center;">
         <h2 style="">YOLO Live</h2>
         <div class="live-videos">
-            <img src="/video/0" />
+            """ + \
+            f"""
+            <img src="/video/{mode}/0" />
+            """ + \
+            """
         </div>
     </body>
     <script>
@@ -241,7 +411,7 @@ def index(streams: int = Query(1)):
             for (let i = 1; i < streams; i++) {
                 setTimeout(() => {
                     img = new_img.cloneNode()
-                    img.src = `/video/${i}`
+                    img.src = `/video/${yolo_mode}/${i}`
                     img0.parentElement.insertBefore(img, img0)
                 }, 3000 * i);
             }
@@ -251,9 +421,23 @@ def index(streams: int = Query(1)):
     """
 
 
+@app.on_event("startup")
+def start_threads():
+    threading.Thread(target=yolo_preprocess_worker, daemon=True).start()
+    threading.Thread(target=yolo_inference_worker, daemon=True).start()
+    threading.Thread(target=yolo_postprocess_worker, daemon=True).start()
+
+
+@app.on_event("shutdown")
+def shutdown():
+    stop_event.set()
+    exit(0)
+
+
 if __name__ == "__main__":
 
     if args.live_on_local:
         live_yolo_detect_stream(model, loop=True, pos=[5, 5])
     else:
         uvicorn.run(app, host="0.0.0.0", port=args.port, reload=False)
+
