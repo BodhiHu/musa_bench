@@ -89,6 +89,8 @@ def mjpeg_stream_reader():
     response = requests.get(STREAM_URL, stream=True)
     bytes_data = b""
 
+    fps = 0
+    last_time = None
     for chunk in response.iter_content(chunk_size=1024):
         bytes_data += chunk
         a = bytes_data.find(b"\xff\xd8")  # Start of JPEG
@@ -102,6 +104,14 @@ def mjpeg_stream_reader():
             frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
             yield frame
 
+            if VERBOSE:
+                cur_time = time.time()
+                if last_time is not None:
+                    delta = cur_time - last_time
+                    fps = 1 / delta
+                last_time = cur_time
+                print(f"-> incoming fps  = {fps:.2f}")
+
 
 def init_model():
     print(f"INFO: loading model ...")
@@ -111,7 +121,7 @@ def init_model():
     model.model.to(device)
     print(f"INFO: warming up model ...")
     for _ in range(3):
-        model.predict(IMAGES_PATH / "行者 - 1920x1280.jpg", **model_kwargs)
+        model.predict(IMAGES_PATH / "行者 - 1920x1080.jpg", **model_kwargs)
 
     model.predictor._lock = EmptyContextManager()
     print(f"INFO: model ready ✔")
@@ -206,6 +216,12 @@ class QueuedStream:
         self.output_queue        = queue.Queue(maxsize=30)
         self.stop_event          = threading.Event()
 
+        self.processed_frames    = 0
+        self.total_time          = 0
+        self.fps                 = 0
+        self.model_fps           = 0
+        self.prep_fps            = 0
+
         QueuedStream.next_stream_idx += 1
 
         print(f"INFO: created new stream = {self.idx}")
@@ -242,22 +258,18 @@ def yolo_preprocess_worker():
             _streams = dict(streams)
 
         for s_idx, stream in _streams.items():
-
+            start_time = time.time()
             frame = next(stream.stream_reader)
-
-            # try:
-            #     frame = stream.input_frames_queue.get(block=False)
-            #     empty = False
-            # except queue.Empty:
-            #     continue
 
             if frame is None:
                 continue
 
-            print(f">>>>> PREDICT PREPROCESS")
             results = model.predict(frame, **model_kwargs, phase='preprocess')
             data = (frame, results)
             put_to_queue(f"inference_queue[{s_idx}]", stream.inference_queue, data)
+
+            delta = time.time() - start_time
+            stream.prep_fps = 1 / delta
 
         if empty:
             sleep_ms(10)
@@ -277,14 +289,13 @@ def yolo_inference_worker():
             except queue.Empty:
                 continue
 
-            pred_start  = time.time()
-            print(f">>>>> PREDICT INFERENCE")
+            infer_start  = time.time()
             results = model.predict(frame, **model_kwargs, phase_input=phase_input, phase='inference')
-            pred_end = time.time()
-            pred_time = pred_end - pred_start
-            fps = 1 / pred_time
+            infer_time = time.time() - infer_start
+            fps = 1 / infer_time
             data = (frame, results, fps)
             put_to_queue(f"model_output_queue[{s_idx}]", stream.model_output_queue, data)
+            stream.model_fps = fps
 
         if empty:
             # print("WARN: all stream inference queues are empty, will wait 10ms for new requests")
@@ -292,6 +303,9 @@ def yolo_inference_worker():
 
 
 def yolo_postprocess_worker():
+    processed = 0
+    delta_thres = 80 / 1000 # 80ms
+
     while not stop_event.is_set():
         empty = True
         with streams_lock:
@@ -299,16 +313,17 @@ def yolo_postprocess_worker():
             _streams = dict(streams)
 
         for s_idx, stream in _streams.items():
+            start_time = time.time()
             try:
-                (frame, phase_input, fps) = stream.model_output_queue.get(block=False)
+                (frame, phase_input, model_fps) = stream.model_output_queue.get(block=False)
                 empty = False
             except queue.Empty:
                 continue
 
-            print(f">>>>> PREDICT POSTPROCESS")
             results = model.predict(frame, **model_kwargs, phase_input=phase_input, phase='postprocess')
             annotated_frame = results[0].plot()
-            cv2.putText(annotated_frame, f"FPS: {fps:.2f}", (20, 40),
+
+            cv2.putText(annotated_frame, f"FPS: {stream.fps:.2f}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
             # Encode to JPEG
@@ -318,6 +333,20 @@ def yolo_postprocess_worker():
 
             frame_bytes = jpeg.tobytes()
             put_to_queue(f"output_queue[{s_idx}]", stream.output_queue, frame_bytes)
+
+            # calculate fps ############################################################
+            processed += 1
+            if processed > 60:
+                delta = time.time() - start_time
+                # skip frames that comes in late due to bad network condition .etc
+                if delta < delta_thres:
+                    # stream.total_time += delta
+                    # stream.processed_frames += 1
+                    # stream.fps = stream.processed_frames / stream.total_time
+                    stream.fps = 1 / delta
+                if VERBOSE:
+                    print(f"<- outcoming fps = {stream.fps:.2f}, prep fps = {stream.prep_fps:.2f}, model fps = {stream.model_fps:.2f}")
+            ############################################################################
 
         if empty:
             sleep_ms(10)
@@ -356,35 +385,37 @@ def yolo_synced_stream():
             "verbose"            : VERBOSE
         }
 
-        print(f">>>>> input frame: {type(frame)}")
         phase_input = None
+        pred_start  = time.time()
         pre_out     = model.predict(frame, **kwargs, phase_input=phase_input, phase='preprocess')
-        print(f">>>>> preprocess -> {type(pre_out)}, {type(pre_out[0])}")
-        print_nested_types(pre_out)
+        pred_end    = time.time()
+        pre_time    = pred_end - pred_start
 
         pred_start  = time.time()
         infer_out   = model.predict(frame, **kwargs, phase_input=pre_out, phase='inference')
-        print(f">>>>> inference  -> {type(infer_out)}, {type(infer_out[0])}")
-        print_nested_types(infer_out)
         pred_end    = time.time()
+        pred_time   = pred_end - pred_start
 
+        pred_start  = time.time()
         results     = model.predict(frame, **kwargs, phase_input=infer_out, phase='postprocess')
-        print(f">>>>> postprocs  -> {type(results)}, {type(results[0])}")
+        pred_end    = time.time()
+        post_time   = pred_end - pred_start
 
-        pred_time = pred_end - pred_start
-        fps = 1 / pred_time
+        model_fps = 1 / pred_time
 
         plot_time = time.time()
         # Draw results on frame
         annotated_frame = results[0].plot()
 
+        cur_time = time.time()
+        delta_time = 0
+        if prev_time is not None:
+            delta_time = cur_time - prev_time
+            fps = 1 / delta_time
+        prev_time = cur_time
+
         if VERBOSE:
-            cur_time = time.time()
-            total_time = 0
-            if prev_time is not None:
-                total_time = cur_time - prev_time
-            prev_time = cur_time
-            print(f"fps = {fps:.2f}, model time = {(pred_time*1000):.2f}ms, time = {(total_time * 1000):.2f}ms")
+            print(f"fps = {fps:.2f}, time = {(delta_time * 1000):.2f}ms, model_fps = {model_fps:.2f}, model time = {(pred_time*1000):.2f}ms, pre_time = {pre_time*1000:.2f}, post_time = {post_time*1000:.2f}")
 
         cv2.putText(annotated_frame, f"FPS: {fps:.2f}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
@@ -395,7 +426,6 @@ def yolo_synced_stream():
             continue
 
         frame_bytes = jpeg.tobytes()
-        print(f">>>>> final results: {type(jpeg)}, {type(frame_bytes)}")
 
         if VERBOSE:
             print(f"plots to jpeg time: {((time.time()-plot_time)*1000):.2f}ms")
@@ -417,21 +447,7 @@ def yolo_sync(index: int = 0):
 
 @app.get("/video/pipelined/{index}")
 def yolo_pipelined(index: int):
-
     stream = add_stream()
-
-    # def read_frames_task(stream: QueuedStream):
-    #     for frame in stream.stream_reader:
-    #         if frame is None:
-    #             break
-
-    #         # frame = torch.from_numpy(frame).share_memory_()
-
-    #         print(f">>>>> add new data to input_frames_queue[{stream.idx}]")
-    #         put_to_queue(f"input_frames_queue[{stream.idx}]", stream.input_frames_queue, frame)
-
-    # threading.Thread(target=read_frames_task, args=(stream,)).start()
-
     res = StreamingResponse(yolo_pipelined_stream(stream), media_type='multipart/x-mixed-replace; boundary=frame')
 
     async def on_close():
