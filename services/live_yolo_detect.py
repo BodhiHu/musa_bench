@@ -364,10 +364,6 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
             gpu_results = None
             npu_results = None
             if dev_type == 'musa':
-                if len(stream_ids) > 0 and s_idx not in stream_ids:
-                    continue
-
-                print(">>>>> running on GPU")
 
                 results = gpu_model.predict(frame, **model_kwargs, phase_input=input_tensors, phase='inference')
                 preds_tensor: torch.Tensor = results[0][0]
@@ -379,14 +375,12 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
                 print(">>>>> GPU predict results and input:")
                 print_nested_types(gpu_results)
             elif dev_type == 'npu':
-                if len(stream_ids) > 0 and s_idx not in stream_ids:
-                    continue
-
-                print(">>>>> running on NPU")
 
                 npu_start = time.time()
                 npu_input_tensor: torch.Tensor = npu_tensors[0]
                 assert npu_input_tensor.device.type == 'cpu'
+                assert npu_input_tensor.is_contiguous()
+                # npu_outs: List[np.ndarray] = npu_model(npu_input_tensor.contiguous().numpy())
                 npu_outs: List[np.ndarray] = npu_model(npu_input_tensor.numpy())
                 npu_preds_tensor = torch.from_numpy(npu_outs[0])
                 npu_results = [npu_preds_tensor, npu_input_tensor]
@@ -623,9 +617,9 @@ def index(streams: int = Query(1), mode: YoloLiveMode = Query(YoloLiveMode.pipel
 def start_threads():
     threading.Thread(target=yolo_preprocess_worker,  name="yolo_preprocess_worker",         daemon=True).start()
     threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0",   daemon=True,
-                     kwargs={"device": "musa:0", "stream_ids": [0]}).start()
+                     kwargs={"device": "musa:0", "stream_ids": [1]}).start()
     threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0",    daemon=True,
-                     kwargs={"device": "npu:0",  "stream_ids": [1]}).start()
+                     kwargs={"device": "npu:0",  "stream_ids": [0]}).start()
     # threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1",    daemon=True,
     #                  kwargs={"device": "npu:1",  "streams": [2]}).start()
     threading.Thread(target=yolo_postprocess_worker, name="yolo_postprocess_worker",        daemon=True).start()

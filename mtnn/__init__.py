@@ -85,7 +85,7 @@ class MtnnYOLOModel:
     def __init__(self, model_path, core_id:int = 0):
         self.model = MTNNSession(model_path, core_id)
 
-    def __call__(self, input):
+    def __call__(self, input: np.ndarray):
         preds = self.model.run({0: input})
         return preds
 
