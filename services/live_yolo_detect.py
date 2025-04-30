@@ -1,4 +1,5 @@
 import os, sys
+import traceback
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(current_dir)
@@ -99,29 +100,34 @@ def mjpeg_stream_reader():
     """Yield individual JPEG frames from an MJPEG stream."""
     response = requests.get(STREAM_URL, stream=True)
     bytes_data = b""
+    print("INFO: opened new stream connection")
 
-    fps = 0
-    last_time = None
-    for chunk in response.iter_content(chunk_size=1024):
-        bytes_data += chunk
-        a = bytes_data.find(b"\xff\xd8")  # Start of JPEG
-        b = bytes_data.find(b"\xff\xd9")  # End of JPEG
+    try:
+        fps = 0
+        last_time = None
+        for chunk in response.iter_content(chunk_size=1024):
+            bytes_data += chunk
+            a = bytes_data.find(b"\xff\xd8")  # Start of JPEG
+            b = bytes_data.find(b"\xff\xd9")  # End of JPEG
 
-        if a != -1 and b != -1:
-            jpg = bytes_data[a:b+2]
-            bytes_data = bytes_data[b+2:]
+            if a != -1 and b != -1:
+                jpg = bytes_data[a:b+2]
+                bytes_data = bytes_data[b+2:]
 
-            img_array = np.frombuffer(jpg, dtype=np.uint8)
-            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-            yield frame
+                img_array = np.frombuffer(jpg, dtype=np.uint8)
+                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                yield frame
 
-            if VERBOSE:
-                cur_time = time.time()
-                if last_time is not None:
-                    delta = cur_time - last_time
-                    fps = 1 / delta
-                last_time = cur_time
-                print(f"-> incoming fps  = {fps:.2f}")
+                if VERBOSE:
+                    cur_time = time.time()
+                    if last_time is not None:
+                        delta = cur_time - last_time
+                        fps = 1 / delta
+                    last_time = cur_time
+                    print(f"-> incoming fps  = {fps:.2f}")
+    finally:
+        print("INFO: closing stream connection")
+        response.close()
 
 
 def init_model():
@@ -220,7 +226,8 @@ class QueuedStream:
 
     def __init__(self):
         self.idx                 = QueuedStream.next_stream_idx
-        self.stream_reader       = mjpeg_stream_reader()
+        self._stream_reader      = None
+        self.stream_started      = False
         self.input_frames_queue  = queue.Queue(maxsize=30)
         self.inference_queue     = queue.Queue(maxsize=30)
         self.model_output_queue  = queue.Queue(maxsize=30)
@@ -238,28 +245,30 @@ class QueuedStream:
 
         print(f"INFO: created new stream = {self.idx}")
 
+    def stream_reader(self):
+        return self._stream_reader
 
-streams: Dict[int, QueuedStream] = {}
-streams_lock = threading.Lock()
+    def start(self):
+        self.stream_started = True
+        self._stream_reader = mjpeg_stream_reader()
+
+    def stop(self):
+        self.stream_started = False
+        self._stream_reader.close()
+        self._stream_reader = None
+
+
+streams: Dict[int, QueuedStream] = {
+    0: QueuedStream(),
+    1: QueuedStream(),
+    2: QueuedStream(),
+    3: QueuedStream(),
+    4: QueuedStream(),
+    5: QueuedStream(),
+    6: QueuedStream(),
+    7: QueuedStream(),
+}
 stop_event = threading.Event()
-
-
-def add_stream():
-    with streams_lock:
-        stream = QueuedStream()
-        streams[stream.idx] = stream
-
-    print(f"INFO: added new stream: {stream.idx}")
-    return stream
-
-
-def remove_stream(stream_id: int):
-    with streams_lock:
-        if stream_id in streams:
-            streams[stream_id].stop_event.set()
-            del streams[stream_id]
-
-    print(f"INFO: removed stream: {stream_id}")
 
 
 def exit_on_error(func):
@@ -268,6 +277,7 @@ def exit_on_error(func):
             return func(*args, **kwargs)
         except Exception as e:
             print(f"[Exception caught in {func.__name__}]: {e}")
+            traceback.print_exc()  # prints the full traceback to stderr
             os._exit(-1)
     return wrapper
 
@@ -275,26 +285,26 @@ def exit_on_error(func):
 def yolo_preprocess_worker():
     while not stop_event.is_set():
         empty = True
-        with streams_lock:
-            # shallow copy
-            _streams = dict(streams)
 
-        for s_idx, stream in _streams.items():
+        for s_idx, stream in streams.items():
             start_time = time.time()
-            frame = next(stream.stream_reader)
-
-            if frame is None:
+            stream_reader = stream.stream_reader()
+            if stream_reader is None:
                 continue
 
-            # we need 640 boxed tensor for later NPU inference, no limits for GPU
+            frame = next(stream_reader)
+            if frame is None:
+                continue
+            empty = False
+
             kwargs = dict(model_kwargs)
-            # kwargs["imgsz"] = 640
             # Tensor of shape [1, 3, 192, 320]
             tensors: List[torch.Tensor] = model.predict(frame, phase='preprocess', **kwargs)
             assert tensors[0].device.type == 'cpu'
 
             # pad for NPU #############################################################################
             """center and reshape to 640x640"""
+            # we need 640 boxed tensor for later NPU inference, no limits for GPU
             kwargs["imgsz"] = 640
             npu_tensors: List[torch.Tensor] = model.predict(frame, phase='preprocess', **kwargs)
             assert npu_tensors[0].device.type == 'cpu'
@@ -310,11 +320,11 @@ def yolo_preprocess_worker():
             pad_right = pad_w - pad_left
             # Apply padding: (left, right, top, bottom)
             tensor = nnf.pad(npu_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
-            npu_inputs = [tensor]
             assert tensor.device.type == 'cpu'
+            npu_tensors = [tensor]
             ###########################################################################################
 
-            data = (frame, tensors, npu_inputs)
+            data = (frame, tensors, npu_tensors)
             put_to_queue(f"inference_queue[{s_idx}]", stream.inference_queue, data)
 
             delta = time.time() - start_time
@@ -323,26 +333,26 @@ def yolo_preprocess_worker():
         if empty:
             sleep_ms(10)
 
-
 @exit_on_error
-def yolo_inference_worker(device="musa:0"):
+def yolo_inference_worker(device="musa:0", stream_ids=[]):
     dev_type, dev_id = device.split(":")
     dev_id = int(dev_id)
     gpu_model = model
     npu_model = None
+
 
     if dev_type == 'npu' and npu_model is None:
         npu_model = MtnnYOLOModel("./assets/mtnn/yolov8m_quantized.nb", dev_id)
 
     while not stop_event.is_set():
         empty = True
-        with streams_lock:
-            # shallow copy
-            _streams = dict(streams)
 
-        for s_idx, stream in _streams.items():
+        for s_idx, stream in streams.items():
+            if len(stream_ids) > 0 and s_idx not in stream_ids:
+                continue
+
             try:
-                (frame, input_tensors, npu_inputs) = stream.inference_queue.get(block=False)
+                (frame, input_tensors, npu_tensors) = stream.inference_queue.get(block=False)
                 empty = False
             except queue.Empty:
                 continue
@@ -354,6 +364,11 @@ def yolo_inference_worker(device="musa:0"):
             gpu_results = None
             npu_results = None
             if dev_type == 'musa':
+                if len(stream_ids) > 0 and s_idx not in stream_ids:
+                    continue
+
+                print(">>>>> running on GPU")
+
                 results = gpu_model.predict(frame, **model_kwargs, phase_input=input_tensors, phase='inference')
                 preds_tensor: torch.Tensor = results[0][0]
                 input_tensor: torch.Tensor = results[1]
@@ -364,8 +379,13 @@ def yolo_inference_worker(device="musa:0"):
                 print(">>>>> GPU predict results and input:")
                 print_nested_types(gpu_results)
             elif dev_type == 'npu':
+                if len(stream_ids) > 0 and s_idx not in stream_ids:
+                    continue
+
+                print(">>>>> running on NPU")
+
                 npu_start = time.time()
-                npu_input_tensor: torch.Tensor = npu_inputs[0]
+                npu_input_tensor: torch.Tensor = npu_tensors[0]
                 assert npu_input_tensor.device.type == 'cpu'
                 npu_outs: List[np.ndarray] = npu_model(npu_input_tensor.numpy())
                 npu_preds_tensor = torch.from_numpy(npu_outs[0])
@@ -377,7 +397,7 @@ def yolo_inference_worker(device="musa:0"):
                 print(">>>>> NPU predict outs:")
                 print_nested_types(npu_outs)
             else:
-                print(f"ERROR: unknown device type: {dev_type}")
+                print(f"ERROR: can't decide which device to run for stream[{s_idx}]: device = {device}, stream_ids = {stream_ids}")
                 os._exit(-1)
 
             data = (frame, gpu_results, npu_results)
@@ -394,11 +414,8 @@ def yolo_postprocess_worker():
 
     while not stop_event.is_set():
         empty = True
-        with streams_lock:
-            # shallow copy
-            _streams = dict(streams)
 
-        for s_idx, stream in _streams.items():
+        for s_idx, stream in streams.items():
             start_time = time.time()
             try:
                 (frame, gpu_results, npu_results) = stream.model_output_queue.get(block=False)
@@ -406,11 +423,13 @@ def yolo_postprocess_worker():
             except queue.Empty:
                 continue
 
-            phase_input = npu_results
+            device = 'GPU' if gpu_results is not None else 'NPU'
+            phase_input = gpu_results or npu_results
+            assert phase_input is not None
             results = model.predict(frame, **model_kwargs, phase_input=phase_input, phase='postprocess')
             annotated_frame = results[0].plot()
 
-            cv2.putText(annotated_frame, f"FPS: {stream.fps:.2f}", (20, 40),
+            cv2.putText(annotated_frame, f"{device} FPS: {stream.fps:.2f}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
             # Encode to JPEG
@@ -440,7 +459,7 @@ def yolo_postprocess_worker():
 
 
 def yolo_pipelined_stream(stream: QueuedStream):
-    while not stop_event.is_set() and not stream.stop_event.is_set():
+    while not stop_event.is_set() and not stream.stop_event.is_set() and stream.stream_started:
         try:
             frame_bytes = stream.output_queue.get(block=True)
         except queue.Empty:
@@ -533,12 +552,13 @@ def yolo_sync(index: int = 0):
     return StreamingResponse(yolo_synced_stream(), media_type='multipart/x-mixed-replace; boundary=frame')
 
 @app.get("/video/pipelined/{index}")
-def yolo_pipelined(index: int):
-    stream = add_stream()
+def yolo_pipelined(index: int = 0):
+    stream = streams[index]
+    stream.start()
     res = StreamingResponse(yolo_pipelined_stream(stream), media_type='multipart/x-mixed-replace; boundary=frame')
 
     async def on_close():
-        remove_stream(stream_id=stream.idx)
+        stream.stop()
     res.background = BackgroundTask(on_close)
 
     return res
@@ -590,7 +610,7 @@ def index(streams: int = Query(1), mode: YoloLiveMode = Query(YoloLiveMode.pipel
                 setTimeout(() => {
                     img = new_img.cloneNode()
                     img.src = `/video/${yolo_mode}/${i}`
-                    img0.parentElement.insertBefore(img, img0)
+                    img0.parentElement.append(img)
                 }, 3000 * i);
             }
         }
@@ -603,11 +623,11 @@ def index(streams: int = Query(1), mode: YoloLiveMode = Query(YoloLiveMode.pipel
 def start_threads():
     threading.Thread(target=yolo_preprocess_worker,  name="yolo_preprocess_worker",         daemon=True).start()
     threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0",   daemon=True,
-                     kwargs={"device": "musa:0"}).start()
+                     kwargs={"device": "musa:0", "stream_ids": [0]}).start()
     threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0",    daemon=True,
-                     kwargs={"device": "npu:0"}).start()
-    threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1",    daemon=True,
-                     kwargs={"device": "npu:1"}).start()
+                     kwargs={"device": "npu:0",  "stream_ids": [1]}).start()
+    # threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1",    daemon=True,
+    #                  kwargs={"device": "npu:1",  "streams": [2]}).start()
     threading.Thread(target=yolo_postprocess_worker, name="yolo_postprocess_worker",        daemon=True).start()
 
 
