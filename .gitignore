@@ -7,3 +7,4 @@ datasets/
 *.pt
 *.pth
 *.msys-rep
+*.egg-info

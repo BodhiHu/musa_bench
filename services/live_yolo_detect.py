@@ -1,3 +1,10 @@
+import os, sys
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(current_dir)
+sys.path.append(os.path.abspath(f"{current_dir}/.."))
+sys.path.append(os.path.abspath(f"{current_dir}/../.."))
+
 import argparse
 from datetime import datetime
 from enum import Enum
@@ -7,8 +14,8 @@ from typing import Dict, List
 import torch
 import torch_musa
 import torch_musa.cuda_compat
+import torch.nn.functional as nnf
 import cv2
-import os
 import requests
 import numpy as np
 import uvicorn
@@ -22,6 +29,7 @@ from pathlib import Path
 import threading
 import multiprocessing as mproc
 from multiprocessing import shared_memory
+from musa_bench.mtnn import MtnnYOLOModel
 
 
 DEFAULT_STREAM_URL = "http://192.168.164.136:8686/video"
@@ -67,7 +75,10 @@ class EmptyContextManager:
 
 def print_nested_types(obj, depth=0):
     indent = "  " * depth
-    print(f"{indent}{type(obj).__name__}")
+    shape = ""
+    if isinstance(obj, (torch.Tensor, np.ndarray)):
+        shape = f" {obj.shape}"
+    print(f"{indent}{type(obj).__name__}{shape}")
     if isinstance(obj, (list, tuple)):
         for item in obj:
             print_nested_types(item, depth + 1)
@@ -220,6 +231,7 @@ class QueuedStream:
         self.total_time          = 0
         self.fps                 = 0
         self.model_fps           = 0
+        self.npu_model_fps       = 0
         self.prep_fps            = 0
 
         QueuedStream.next_stream_idx += 1
@@ -250,6 +262,16 @@ def remove_stream(stream_id: int):
     print(f"INFO: removed stream: {stream_id}")
 
 
+def exit_on_error(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            print(f"[Exception caught in {func.__name__}]: {e}")
+            os._exit(-1)
+    return wrapper
+
+
 def yolo_preprocess_worker():
     while not stop_event.is_set():
         empty = True
@@ -264,8 +286,35 @@ def yolo_preprocess_worker():
             if frame is None:
                 continue
 
-            results = model.predict(frame, **model_kwargs, phase='preprocess')
-            data = (frame, results)
+            # we need 640 boxed tensor for later NPU inference, no limits for GPU
+            kwargs = dict(model_kwargs)
+            # kwargs["imgsz"] = 640
+            # Tensor of shape [1, 3, 192, 320]
+            tensors: List[torch.Tensor] = model.predict(frame, phase='preprocess', **kwargs)
+            assert tensors[0].device.type == 'cpu'
+
+            # pad for NPU #############################################################################
+            """center and reshape to 640x640"""
+            kwargs["imgsz"] = 640
+            npu_tensors: List[torch.Tensor] = model.predict(frame, phase='preprocess', **kwargs)
+            assert npu_tensors[0].device.type == 'cpu'
+            npu_tensor = npu_tensors[0]
+            target_h, target_w = 640, 640
+            h, w = npu_tensor.shape[2], npu_tensor.shape[3]
+            # Compute padding
+            pad_h = target_h - h  # 448
+            pad_w = target_w - w  # 320
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            # Apply padding: (left, right, top, bottom)
+            tensor = nnf.pad(npu_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+            npu_inputs = [tensor]
+            assert tensor.device.type == 'cpu'
+            ###########################################################################################
+
+            data = (frame, tensors, npu_inputs)
             put_to_queue(f"inference_queue[{s_idx}]", stream.inference_queue, data)
 
             delta = time.time() - start_time
@@ -275,7 +324,16 @@ def yolo_preprocess_worker():
             sleep_ms(10)
 
 
-def yolo_inference_worker():
+@exit_on_error
+def yolo_inference_worker(device="musa:0"):
+    dev_type, dev_id = device.split(":")
+    dev_id = int(dev_id)
+    gpu_model = model
+    npu_model = None
+
+    if dev_type == 'npu' and npu_model is None:
+        npu_model = MtnnYOLOModel("./assets/mtnn/yolov8m_quantized.nb", dev_id)
+
     while not stop_event.is_set():
         empty = True
         with streams_lock:
@@ -284,18 +342,46 @@ def yolo_inference_worker():
 
         for s_idx, stream in _streams.items():
             try:
-                (frame, phase_input) = stream.inference_queue.get(block=False)
+                (frame, input_tensors, npu_inputs) = stream.inference_queue.get(block=False)
                 empty = False
             except queue.Empty:
                 continue
 
-            infer_start  = time.time()
-            results = model.predict(frame, **model_kwargs, phase_input=phase_input, phase='inference')
-            infer_time = time.time() - infer_start
-            fps = 1 / infer_time
-            data = (frame, results, fps)
+            print(">>>>> predict input:")
+            print_nested_types(input_tensors)
+
+            gpu_start = time.time()
+            gpu_results = None
+            npu_results = None
+            if dev_type == 'musa':
+                results = gpu_model.predict(frame, **model_kwargs, phase_input=input_tensors, phase='inference')
+                preds_tensor: torch.Tensor = results[0][0]
+                input_tensor: torch.Tensor = results[1]
+                assert preds_tensor.device.type == 'musa'
+                assert input_tensor.device.type == 'musa'
+                gpu_results = [preds_tensor, input_tensor]
+                stream.model_fps = 1 / (time.time() - gpu_start)
+                print(">>>>> GPU predict results and input:")
+                print_nested_types(gpu_results)
+            elif dev_type == 'npu':
+                npu_start = time.time()
+                npu_input_tensor: torch.Tensor = npu_inputs[0]
+                assert npu_input_tensor.device.type == 'cpu'
+                npu_outs: List[np.ndarray] = npu_model(npu_input_tensor.numpy())
+                npu_preds_tensor = torch.from_numpy(npu_outs[0])
+                npu_results = [npu_preds_tensor, npu_input_tensor]
+                stream.npu_model_fps = 1 / (time.time() - npu_start)
+
+                print(">>>>> NPU predict results and input:")
+                print_nested_types(npu_results)
+                print(">>>>> NPU predict outs:")
+                print_nested_types(npu_outs)
+            else:
+                print(f"ERROR: unknown device type: {dev_type}")
+                os._exit(-1)
+
+            data = (frame, gpu_results, npu_results)
             put_to_queue(f"model_output_queue[{s_idx}]", stream.model_output_queue, data)
-            stream.model_fps = fps
 
         if empty:
             # print("WARN: all stream inference queues are empty, will wait 10ms for new requests")
@@ -315,11 +401,12 @@ def yolo_postprocess_worker():
         for s_idx, stream in _streams.items():
             start_time = time.time()
             try:
-                (frame, phase_input, model_fps) = stream.model_output_queue.get(block=False)
+                (frame, gpu_results, npu_results) = stream.model_output_queue.get(block=False)
                 empty = False
             except queue.Empty:
                 continue
 
+            phase_input = npu_results
             results = model.predict(frame, **model_kwargs, phase_input=phase_input, phase='postprocess')
             annotated_frame = results[0].plot()
 
@@ -345,7 +432,7 @@ def yolo_postprocess_worker():
                     # stream.fps = stream.processed_frames / stream.total_time
                     stream.fps = 1 / delta
                 if VERBOSE:
-                    print(f"<- outcoming fps = {stream.fps:.2f}, prep fps = {stream.prep_fps:.2f}, model fps = {stream.model_fps:.2f}")
+                    print(f"<- outcoming fps = {stream.fps:.2f}, prep fps = {stream.prep_fps:.2f}, model fps = {stream.model_fps:.2f}, npu model fps = {stream.npu_model_fps:.2f}")
             ############################################################################
 
         if empty:
@@ -514,9 +601,14 @@ def index(streams: int = Query(1), mode: YoloLiveMode = Query(YoloLiveMode.pipel
 
 @app.on_event("startup")
 def start_threads():
-    threading.Thread(target=yolo_preprocess_worker,  name="yolo_preprocess_worker",  daemon=True).start()
-    threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker",   daemon=True).start()
-    threading.Thread(target=yolo_postprocess_worker, name="yolo_postprocess_worker", daemon=True).start()
+    threading.Thread(target=yolo_preprocess_worker,  name="yolo_preprocess_worker",         daemon=True).start()
+    threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0",   daemon=True,
+                     kwargs={"device": "musa:0"}).start()
+    threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0",    daemon=True,
+                     kwargs={"device": "npu:0"}).start()
+    threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1",    daemon=True,
+                     kwargs={"device": "npu:1"}).start()
+    threading.Thread(target=yolo_postprocess_worker, name="yolo_postprocess_worker",        daemon=True).start()
 
 
 @app.on_event("shutdown")
