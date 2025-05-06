@@ -96,38 +96,38 @@ def get_cv_wind_size():
     return (width - 10, height - 10)
 
 
-def mjpeg_stream_reader():
+def mjpeg_stream_reader(tag = ""):
     """Yield individual JPEG frames from an MJPEG stream."""
-    response = requests.get(STREAM_URL, stream=True)
-    bytes_data = b""
-    print("INFO: opened new stream connection")
+    with requests.get(STREAM_URL, stream=True) as response:
+        bytes_data = b""
+        print("INFO: opened new stream connection")
 
-    try:
-        fps = 0
-        last_time = None
-        for chunk in response.iter_content(chunk_size=1024):
-            bytes_data += chunk
-            a = bytes_data.find(b"\xff\xd8")  # Start of JPEG
-            b = bytes_data.find(b"\xff\xd9")  # End of JPEG
+        try:
+            fps = 0
+            last_time = None
+            for chunk in response.iter_content(chunk_size=1024):
+                bytes_data += chunk
+                a = bytes_data.find(b"\xff\xd8")  # Start of JPEG
+                b = bytes_data.find(b"\xff\xd9")  # End of JPEG
 
-            if a != -1 and b != -1:
-                jpg = bytes_data[a:b+2]
-                bytes_data = bytes_data[b+2:]
+                if a != -1 and b != -1:
+                    jpg = bytes_data[a:b+2]
+                    bytes_data = bytes_data[b+2:]
 
-                img_array = np.frombuffer(jpg, dtype=np.uint8)
-                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                yield frame
+                    img_array = np.frombuffer(jpg, dtype=np.uint8)
+                    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                    yield frame
 
-                if VERBOSE:
-                    cur_time = time.time()
-                    if last_time is not None:
-                        delta = cur_time - last_time
-                        fps = 1 / delta
-                    last_time = cur_time
-                    print(f"-> incoming fps  = {fps:.2f}")
-    finally:
-        print("INFO: closing stream connection")
-        response.close()
+                    if VERBOSE:
+                        cur_time = time.time()
+                        if last_time is not None:
+                            delta = cur_time - last_time
+                            fps = 1 / delta
+                        last_time = cur_time
+                        print(f"-> {tag}incoming fps  = {fps:.2f}")
+        finally:
+            print("INFO: closing stream connection")
+            response.close()
 
 
 def init_model():
@@ -226,9 +226,9 @@ class QueuedStream:
 
     def __init__(self):
         self.idx                 = QueuedStream.next_stream_idx
-        self._stream_reader      = None
+        self.frame_reader_thread = None
         self.stream_started      = False
-        self.input_frames_queue  = queue.Queue(maxsize=30)
+        self.input_frames_queue  = queue.Queue(maxsize=120)
         self.inference_queue     = queue.Queue(maxsize=30)
         self.model_output_queue  = queue.Queue(maxsize=30)
         self.output_queue        = queue.Queue(maxsize=30)
@@ -247,18 +247,28 @@ class QueuedStream:
 
         print(f"INFO: created new stream = {self.idx}")
 
-    def stream_reader(self):
-        return self._stream_reader
-
     def start(self):
+        def frame_read_worker():
+            while not self.stop_event.is_set():
+                for frame in mjpeg_stream_reader(f"stream[{self.idx}] "):
+                    if frame is None:
+                        continue
+
+                    if self.stop_event.is_set():
+                        return
+
+                    put_to_queue(f'input_frames_queue[{self.idx}]', self.input_frames_queue, frame)
+
+        self.frame_reader_thread = threading.Thread(
+            target=frame_read_worker, name=f"frame_read_worker[{self.idx}]", daemon=True
+        )
+        self.frame_reader_thread.start()
         self.stream_started = True
-        self._stream_reader = mjpeg_stream_reader()
 
     def stop(self):
+        self.stop_event.set()
+        self.frame_reader_thread.join()
         self.stream_started = False
-        self._stream_reader.close()
-        del self._stream_reader
-        self._stream_reader = None
 
 
 streams: Dict[int, QueuedStream] = {
@@ -266,10 +276,10 @@ streams: Dict[int, QueuedStream] = {
     1: QueuedStream(),
     2: QueuedStream(),
     3: QueuedStream(),
-    4: QueuedStream(),
-    5: QueuedStream(),
-    6: QueuedStream(),
-    7: QueuedStream(),
+    # 4: QueuedStream(),
+    # 5: QueuedStream(),
+    # 6: QueuedStream(),
+    # 7: QueuedStream(),
 }
 
 device_stats = {
@@ -301,13 +311,14 @@ def yolo_preprocess_worker():
 
         for s_idx, stream in active_streams().items():
             start_time = time.time()
-            stream_reader = stream.stream_reader()
-            if stream_reader is None:
+
+            try:
+                frame = stream.input_frames_queue.get(block=False)
+                if frame is None:
+                    continue
+            except queue.Empty:
                 continue
 
-            frame = next(stream_reader)
-            if frame is None:
-                continue
             empty = False
 
             kwargs = dict(model_kwargs)
@@ -373,22 +384,28 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
             # print(">>>>> predict input:")
             # print_nested_types(input_tensors)
 
-            gpu_start = time.time()
             gpu_results = None
             npu_results = None
             if dev_type == 'musa':
 
-                results = gpu_model.predict(frame, **model_kwargs, phase_input=input_tensors, phase='inference')
-                preds_tensor: torch.Tensor = results[0][0]
-                input_tensor: torch.Tensor = results[1]
+                start_time = time.time()
+                # results = gpu_model.predict(frame, **model_kwargs, phase_input=input_tensors, phase='inference')
+                # preds_tensor: torch.Tensor = results[0][0]
+                # input_tensor: torch.Tensor = results[1]
+                input_tensor: torch.Tensor = input_tensors[0].to(device)
+                results = gpu_model.predictor.inference(input_tensors[0].to(device))
+                torch.cuda.synchronize()
+                preds_tensor: torch.Tensor = results[0]
+
                 assert preds_tensor.device.type == 'musa'
                 assert input_tensor.device.type == 'musa'
                 gpu_results = [preds_tensor, input_tensor]
 
-                stream.model_fps = 1 / (time.time() - gpu_start)
+                stream.model_fps = 1 / (time.time() - start_time)
                 device_stats[f"{device}:model_fps"] = stream.model_fps
                 # print(">>>>> GPU predict results and input:")
                 # print_nested_types(gpu_results)
+
             elif dev_type == 'npu':
 
                 npu_start = time.time()
@@ -430,7 +447,6 @@ def yolo_postprocess_worker():
 
         _active_streams = active_streams()
         for s_idx, stream in _active_streams.items():
-            start_time = time.time()
 
             total_fps += stream.fps
 
@@ -439,6 +455,8 @@ def yolo_postprocess_worker():
                 empty = False
             except queue.Empty:
                 continue
+
+            start_time = time.time()
 
             device = 'GPU' if gpu_results is not None else 'NPU'
             phase_input = gpu_results or npu_results
@@ -475,7 +493,7 @@ def yolo_postprocess_worker():
                     # stream.fps = stream.processed_frames / stream.total_time
                     stream.fps = 1 / delta
                 if VERBOSE:
-                    print(f"<- [{device}] outcoming fps = {stream.fps:.2f}, prep_fps = {stream.prep_fps:.2f}, model_fps = {stream.model_fps:.2f}, npu_model_fps = {stream.npu_model_fps:.2f}, post_fps = {stream.post_fps:.2f}")
+                    print(f"<- stream[{s_idx}] outcoming fps = {stream.fps:.2f}, prep_fps = {stream.prep_fps:.2f}, gpu_model_fps = {stream.model_fps:.2f}, npu_model_fps = {stream.npu_model_fps:.2f}, post_fps = {stream.post_fps:.2f}")
 
                 if s_idx == (len(_active_streams)-1):
                     print(f"total_fps = {total_fps:.2f}, total_model_fps = {total_model_fps:.2f}")
