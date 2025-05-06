@@ -100,7 +100,7 @@ def mjpeg_stream_reader(tag = ""):
     """Yield individual JPEG frames from an MJPEG stream."""
     with requests.get(STREAM_URL, stream=True) as response:
         bytes_data = b""
-        print("INFO: opened new stream connection")
+        print(f"INFO: {tag}opened new stream connection")
 
         try:
             fps = 0
@@ -126,8 +126,8 @@ def mjpeg_stream_reader(tag = ""):
                         last_time = cur_time
                         print(f"-> {tag}incoming fps  = {fps:.2f}")
         finally:
-            print("INFO: closing stream connection")
             response.close()
+            print(f"INFO: {tag}closed stream connection")
 
 
 def init_model():
@@ -248,6 +248,15 @@ class QueuedStream:
         print(f"INFO: created new stream = {self.idx}")
 
     def start(self):
+        if self.frame_reader_thread:
+            self.stop()
+
+        while self.stop_event.is_set():
+            print(f"INFO: waiting for stream[{self.idx}] to be closed before starting ...")
+            time.sleep(0.25)
+
+        print(f"INFO: stream[{self.idx}] starting frames input worker ...")
+
         def frame_read_worker():
             while not self.stop_event.is_set():
                 for frame in mjpeg_stream_reader(f"stream[{self.idx}] "):
@@ -255,9 +264,13 @@ class QueuedStream:
                         continue
 
                     if self.stop_event.is_set():
-                        return
+                        break
 
                     put_to_queue(f'input_frames_queue[{self.idx}]', self.input_frames_queue, frame)
+
+            print(f"INFO: stream[{self.idx}] frames input worker will stop")
+            self.stop_event.clear()
+            self.frame_reader_thread = None
 
         self.frame_reader_thread = threading.Thread(
             target=frame_read_worker, name=f"frame_read_worker[{self.idx}]", daemon=True
@@ -267,7 +280,6 @@ class QueuedStream:
 
     def stop(self):
         self.stop_event.set()
-        self.frame_reader_thread.join()
         self.stream_started = False
 
 
@@ -328,8 +340,8 @@ def yolo_preprocess_worker():
 
             # pad for NPU #############################################################################
             """center and reshape to 640x640"""
-            # we need 640 boxed tensor for later NPU inference, no limits for GPU
-            # kwargs["imgsz"] = 640
+            # **MUST SET to 640** for NPU inference, no limits for GPU
+            kwargs["imgsz"] = 640
             npu_tensors: List[torch.Tensor] = model.predict(frame, phase='preprocess', **kwargs)
             assert npu_tensors[0].device.type == 'cpu'
             npu_tensor = npu_tensors[0]
@@ -345,7 +357,7 @@ def yolo_preprocess_worker():
             # Apply padding: (left, right, top, bottom)
             tensor = nnf.pad(npu_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
             assert tensor.device.type == 'cpu'
-            npu_tensors = [tensor]
+            npu_tensors = [tensor.to(torch.float32).contiguous()]
             ###########################################################################################
 
             data = (frame, tensors, npu_tensors)
@@ -410,9 +422,7 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
 
                 npu_start = time.time()
                 npu_input_tensor: torch.Tensor = npu_tensors[0]
-                assert npu_input_tensor.device.type == 'cpu'
-                # assert npu_input_tensor.is_contiguous()
-                npu_outs: List[np.ndarray] = npu_model(npu_input_tensor.to(torch.float32).contiguous().numpy())
+                npu_outs: List[np.ndarray] = npu_model(npu_input_tensor.numpy())
                 npu_preds_tensor = torch.from_numpy(npu_outs[0])
                 npu_results = [npu_preds_tensor, npu_input_tensor]
 
@@ -465,7 +475,8 @@ def yolo_postprocess_worker():
             annotated_frame = results[0].plot()
 
             # fps_text = f"{device} fps: {stream.fps:.2f} total_model_fps: {total_model_fps:.2f}"
-            fps_text = f"{device} total_model_fps: {total_model_fps:.2f}"
+            _model_fps = stream.model_fps if device == 'GPU' else stream.npu_model_fps
+            fps_text = f"{device} model_fps: {_model_fps:.2f} total_model_fps: {total_model_fps:.2f}"
             cv2.putText(annotated_frame, fps_text, (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
@@ -495,8 +506,8 @@ def yolo_postprocess_worker():
                 if VERBOSE:
                     print(f"<- stream[{s_idx}] outcoming fps = {stream.fps:.2f}, prep_fps = {stream.prep_fps:.2f}, gpu_model_fps = {stream.model_fps:.2f}, npu_model_fps = {stream.npu_model_fps:.2f}, post_fps = {stream.post_fps:.2f}")
 
-                if s_idx == (len(_active_streams)-1):
-                    print(f"total_fps = {total_fps:.2f}, total_model_fps = {total_model_fps:.2f}")
+                    if s_idx == (len(_active_streams)-1):
+                        print(f"total_fps = {total_fps:.2f}, total_model_fps = {total_model_fps:.2f}")
             ############################################################################
 
         if empty:
@@ -598,13 +609,17 @@ def yolo_sync(index: int = 0):
 
 @app.get("/video/pipelined/{index}")
 def yolo_pipelined(index: int = 0):
+    print(f"INFO: stream[{index}] starting ...")
     stream = streams[index]
     stream.start()
+    print(f"INFO: stream[{index}] started")
     res = StreamingResponse(yolo_pipelined_stream(stream), media_type='multipart/x-mixed-replace; boundary=frame')
 
-    async def on_close():
-        stream.stop()
-    res.background = BackgroundTask(on_close)
+    # def on_close():
+    #     print(f"INFO: stream[{index}] stopping ...")
+    #     stream.stop()
+    #     print(f"INFO: stream[{index}] stopped")
+    # res.background = BackgroundTask(on_close)
 
     return res
 
@@ -674,13 +689,13 @@ def start_threads():
 
     stream_ids = []
     """inference workers"""
-    stream_ids = [0,1]
+    # stream_ids = [0,1]
     threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0", \
                      daemon=True, kwargs={"device": "musa:0", "stream_ids": stream_ids}).start()
-    stream_ids = [2,3]
+    # stream_ids = [0,1]
     threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0", \
                      daemon=True, kwargs={"device": "npu:0",  "stream_ids": stream_ids}).start()
-    stream_ids = [2,3]
+    # stream_ids = [2,3]
     threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1", \
                      daemon=True, kwargs={"device": "npu:1",  "stream_ids": stream_ids}).start()
 

@@ -1,3 +1,4 @@
+import time
 import numpy as np
 from mtnn_api import MTNN, ffi
 import ctypes
