@@ -335,7 +335,10 @@ def yolo_preprocess_worker():
 
             kwargs = dict(model_kwargs)
             # Tensor of shape [1, 3, 192, 320]
+            _t = time.time()
             tensors: List[torch.Tensor] = model.predict(frame, phase='preprocess', **kwargs)
+            if VERBOSE:
+                print(f":: model preprocess took {((time.time() - _t)*1000):.2f}ms")
             assert tensors[0].device.type == 'cpu'
 
             # pad for NPU #############################################################################
@@ -407,6 +410,8 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
                 input_tensor: torch.Tensor = input_tensors[0].to(device)
                 results = gpu_model.predictor.inference(input_tensors[0].to(device))
                 torch.cuda.synchronize()
+                if VERBOSE:
+                    print(f":: model gpu inference took {((time.time() - start_time)*1000):.2f}ms")
                 preds_tensor: torch.Tensor = results[0]
 
                 assert preds_tensor.device.type == 'musa'
@@ -458,6 +463,7 @@ def yolo_postprocess_worker():
         _active_streams = active_streams()
         for s_idx, stream in _active_streams.items():
 
+            start_time = time.time()
             total_fps += stream.fps
 
             try:
@@ -466,17 +472,18 @@ def yolo_postprocess_worker():
             except queue.Empty:
                 continue
 
-            start_time = time.time()
-
             device = 'GPU' if gpu_results is not None else 'NPU'
             phase_input = gpu_results or npu_results
             assert phase_input is not None
+            _t = time.time()
             results = model.predict(frame, **model_kwargs, phase_input=phase_input, phase='postprocess')
+            if VERBOSE:
+                print(f":: model postprocess took {((time.time() - _t)*1000):.2f}ms")
+
             annotated_frame = results[0].plot()
 
             # fps_text = f"{device} fps: {stream.fps:.2f} total_model_fps: {total_model_fps:.2f}"
-            _model_fps = stream.model_fps if device == 'GPU' else stream.npu_model_fps
-            fps_text = f"{device} model_fps: {_model_fps:.2f} total_model_fps: {total_model_fps:.2f}"
+            fps_text = f"gpu_fps: {stream.model_fps:.2f} npu_fps: {stream.npu_model_fps:.2f} total_model_fps: {total_model_fps:.2f}"
             cv2.putText(annotated_frame, fps_text, (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
@@ -504,7 +511,7 @@ def yolo_postprocess_worker():
                     # stream.fps = stream.processed_frames / stream.total_time
                     stream.fps = 1 / delta
                 if VERBOSE:
-                    print(f"<- stream[{s_idx}] outcoming fps = {stream.fps:.2f}, prep_fps = {stream.prep_fps:.2f}, gpu_model_fps = {stream.model_fps:.2f}, npu_model_fps = {stream.npu_model_fps:.2f}, post_fps = {stream.post_fps:.2f}")
+                    print(f"<- stream[{s_idx}] [{device}] outcoming fps = {stream.fps:.2f}, prep_fps = {stream.prep_fps:.2f}, gpu_model_fps = {stream.model_fps:.2f}, npu_model_fps = {stream.npu_model_fps:.2f}, post_fps = {stream.post_fps:.2f}")
 
                     if s_idx == (len(_active_streams)-1):
                         print(f"total_fps = {total_fps:.2f}, total_model_fps = {total_model_fps:.2f}")
