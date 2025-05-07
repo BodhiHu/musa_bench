@@ -265,7 +265,6 @@ def yolo_detect_video(model: YOLO):
 def put_to_queue(tag: str, queue: Queue, data):
     try:
         if queue.full():
-            # print(f"WARNING: [{tag}] is full, will remove and skip the first frame in queue")
             try:
                 queue.get_nowait()
             except:
@@ -273,7 +272,7 @@ def put_to_queue(tag: str, queue: Queue, data):
 
         queue.put(data, block=False)
     except Exception as exc:
-        print(f"WARNING: [{tag}] put to queue faield, ignoring:", exc)
+        print(f"WARNING: [{tag}] put to queue faield: {type(exc)}: {str(exc)}")
 
 
 def assert_ndarray_on_shm(nd: np.ndarray):
@@ -308,15 +307,6 @@ class QueuedStream:
             "post_fps"           : 0,
         })
 
-        # self.processed_frames    = 0
-        # self.total_time          = 0
-        # self.last_time           = None
-        # self.fps                 = 0
-        # self.model_fps           = 0
-        # self.npu_model_fps       = 0
-        # self.prep_fps            = 0
-        # self.post_fps            = 0
-
         print(f"INFO: created stream = {self.idx}")
 
     def start(self):
@@ -325,7 +315,7 @@ class QueuedStream:
 
         while self.stop_event.is_set():
             print(f"INFO: waiting for stream[{self.idx}] to be closed before starting ...")
-            time.sleep(0.25)
+            time.sleep(1)
 
         print(f"INFO: stream[{self.idx}] starting frames input worker ...")
 
@@ -356,9 +346,8 @@ class QueuedStream:
 
     def stop(self):
         self.stop_event.set()
-        if self.frame_reader_proc:
-            self.frame_reader_proc.kill()
-            self.frame_reader_proc.join()
+        # if self.frame_reader_proc:
+        #     self.frame_reader_proc.join()
         self.frame_reader_proc = None
 
 streams: Dict[int, QueuedStream] = {
@@ -597,7 +586,8 @@ def yolo_postprocess_worker(stop_event, w_streams: Dict[int, Dict]):
             annotated_frame = results[0].plot()
 
             # fps_text = f"{device} fps: {stream.fps:.2f} total_model_fps: {total_model_fps:.2f}"
-            fps_text = f"{device} gpu_fps: {streams[s_idx].stats['model_fps']:.2f} npu_fps: {streams[s_idx].stats['npu_model_fps']:.2f} total_model_fps: {total_model_fps:.2f}"
+            _model_fps = streams[s_idx].stats['model_fps'] if device == 'GPU' else streams[s_idx].stats['npu_model_fps']
+            fps_text = f"{device} Stream{s_idx} model_fps: {_model_fps:.2f} total_model_fps: {total_model_fps:.2f}"
             cv2.putText(annotated_frame, fps_text, (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
