@@ -87,11 +87,11 @@ gpu_model_cfgs = {
 
 npu_model_cfgs = dict(gpu_model_cfgs)
 npu_model_cfgs["imgsz"] = 640
-npu_model_cfgs["half"] = False
+# npu_model_cfgs["half"] = False
 
 cpu_model_cfgs = dict(gpu_model_cfgs)
 cpu_model_cfgs["device"] = "cpu"
-cpu_model_cfgs["half"] = False
+# cpu_model_cfgs["half"] = False
 
 
 class EmptyContextManager:
@@ -180,10 +180,15 @@ def init_cpu_model():
     model = YOLO("yolov8m.pt")
     model.to("cpu")
     model.fuse()
+    model.model = model.model.half()
+    custom = {"conf": 0.25, "batch": 1, "save": False, "mode": "predict"}  # method defaults
+    args = {**model.overrides, **custom, **cpu_model_cfgs}  # highest priority args on the right
+    model.predictor = yolo.detect.DetectionPredictor(overrides=args, _callbacks=model.callbacks)
+    model.predictor.setup_model(model=model.model, verbose=False)
 
-    print(f"INFO: warming up cpu model ...")
-    for _ in range(1):
-        model.predict(IMAGES_PATH / "行者 - 1920x1080.jpg", **cpu_model_cfgs)
+    # print(f"INFO: warming up cpu model ...")
+    # for _ in range(1):
+    #     model.predict(IMAGES_PATH / "行者 - 1920x1080.jpg", **cpu_model_cfgs)
 
     print(f"INFO: cpu model ready ✔")
 
@@ -274,13 +279,17 @@ def put_to_queue(tag: str, queue: Queue, data):
 def assert_ndarray_on_shm(nd: np.ndarray):
     assert not nd.flags.owndata
 
+def assert_tensor_on_shm(t: torch.Tensor):
+    # FIXME: RecursionError in torch_musa
+    # assert t.is_shared()
+    pass
+
 
 class QueuedStream:
 
     def __init__(self, idx: int):
         self.idx                 = idx
         self.frame_reader_proc   = None
-        self.stream_started      = False
         self.input_frames_queue  = Queue(maxsize=120)
         self.inference_queue     = Queue(maxsize=30)
         self.model_output_queue  = Queue(maxsize=30)
@@ -344,14 +353,13 @@ class QueuedStream:
             kwargs={ "idx": self.idx, "input_frames_queue": self.input_frames_queue, "stop_event": self.stop_event }
         )
         self.frame_reader_proc.start()
-        self.stream_started = True
 
     def stop(self):
         self.stop_event.set()
         if self.frame_reader_proc:
             self.frame_reader_proc.kill()
-            self.frame_reader_proc = None
-        self.stream_started = False
+            self.frame_reader_proc.join()
+        self.frame_reader_proc = None
 
 streams: Dict[int, QueuedStream] = {
     0: QueuedStream(0),
@@ -370,9 +378,6 @@ device_stats = mproc_states_manager.dict({
     "npu:1:model_fps"  : 0,
 })
 
-def active_streams():
-    return {k: v for k, v in streams.items() if v.stream_started}
-
 stop_event = Event()
 
 
@@ -383,10 +388,15 @@ def exit_on_error(func):
         except Exception as e:
             print(f"[Exception caught in {func.__name__}]: {e}")
             traceback.print_exc()  # prints the full traceback to stderr
+            stop_event.set()
+            for _, stream in streams.items():
+                stream.stop_event.set()
+
             os._exit(-1)
     return wrapper
 
 
+@exit_on_error
 def yolo_preprocess_worker(stop_event, w_streams: Dict[int, Dict]):
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
@@ -411,22 +421,21 @@ def yolo_preprocess_worker(stop_event, w_streams: Dict[int, Dict]):
 
             # Tensor of shape [1, 3, 192, 320]
             _t = time.time()
-            # preds_tensor: torch.Tensor = model.predict(frame, phase='preprocess', **gpu_model_cfgs)[0]
-            prep_tensor: torch.Tensor = model.predictor.preprocess(frame, **gpu_model_cfgs)
+            # FIXME: directly call model.predictor.preprocess
+            prep_tensor: torch.Tensor = model.predict(frame, phase='preprocess', **gpu_model_cfgs)[0]
+            # prep_tensor: torch.Tensor = model.predictor.preprocess(frame, **gpu_model_cfgs)
             assert prep_tensor.device.type == 'cpu'
             prep_tensor = prep_tensor.share_memory_()
             gpu_tensors = [prep_tensor]
             if VERBOSE:
-                print(f":: model preprocess took {((time.time() - _t)*1000):.2f}ms")
+                print(f":: model preprocess(gpu) took {((time.time() - _t)*1000):.2f}ms")
 
             # pad for NPU #############################################################################
             """center and reshape to 640x640"""
             # **MUST RESHAPE to 640x640** for NPU inference, no limits for GPU
-            # npu_tensor: torch.Tensor = model.predict(frame, phase='preprocess', **npu_model_cfgs)[0]
-            # npu_tensor = npu_tensor.float()
-            npu_tensor: torch.Tensor = model.predictor.preprocess(frame, **npu_model_cfgs)
+            npu_tensor: torch.Tensor = model.predict(frame, phase='preprocess', **npu_model_cfgs)[0]
+            # npu_tensor: torch.Tensor = model.predictor.preprocess(frame, **npu_model_cfgs)
             assert npu_tensor.device.type == 'cpu'
-            assert npu_tensor.dtype == torch.float32
             assert npu_tensor.shape[-1] == 640
             npu_tensor = npu_tensor
             target_h, target_w = 640, 640
@@ -441,13 +450,13 @@ def yolo_preprocess_worker(stop_event, w_streams: Dict[int, Dict]):
             # Apply padding: (left, right, top, bottom)
             tensor = nnf.pad(npu_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
             assert tensor.device.type == 'cpu'
-            npu_tensors = [tensor.contiguous().share_memory_()]
+            npu_tensors = [tensor.contiguous().float().share_memory_()]
             ###########################################################################################
 
             data = (frame, gpu_tensors, npu_tensors)
             assert_ndarray_on_shm(frame)
-            assert gpu_tensors[0].is_shared()
-            assert npu_tensors[0].is_shared()
+            assert_tensor_on_shm(gpu_tensors[0])
+            assert_tensor_on_shm(npu_tensors[0])
             put_to_queue(f"inference_queue[{s_idx}]", w_stream["inference_queue"], data)
 
             delta = time.time() - start_time
@@ -484,8 +493,8 @@ def yolo_inference_worker(stop_event, device: str, w_streams: Dict[int, Dict]):
 
             # assert numpy frame and input tensors are on shared memory
             assert_ndarray_on_shm(frame)
-            assert input_tensors[0].is_shared()
-            assert npu_input_tensors[0].is_shared()
+            assert_tensor_on_shm(input_tensors[0])
+            assert_tensor_on_shm(npu_input_tensors[0])
 
             gpu_results = None
             npu_results = None
@@ -529,18 +538,22 @@ def yolo_inference_worker(stop_event, device: str, w_streams: Dict[int, Dict]):
                 print(f"ERROR: can't decide which device to run for stream[{s_idx}]: device = {device}, stream_ids = {s_idx}")
                 os._exit(-1)
 
-            data = (frame, gpu_results, npu_results)
             assert_ndarray_on_shm(frame)
-            assert gpu_results[0].is_shared()
-            assert gpu_results[1].is_shared()
-            assert npu_results[0].is_shared()
-            assert npu_results[1].is_shared()
+            if gpu_results:
+                assert_tensor_on_shm(gpu_results[0])
+                assert_tensor_on_shm(gpu_results[1])
+            if npu_results:
+                assert_tensor_on_shm(npu_results[0])
+                assert_tensor_on_shm(npu_results[1])
+
+            data = (frame, gpu_results, npu_results)
             put_to_queue(f"model_output_queue[{s_idx}]", w_stream["model_output_queue"], data)
 
         if empty:
             sleep_ms(10)
 
 
+@exit_on_error
 def yolo_postprocess_worker(stop_event, w_streams: Dict[int, Dict]):
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
@@ -571,12 +584,13 @@ def yolo_postprocess_worker(stop_event, w_streams: Dict[int, Dict]):
             assert pred_results is not None
             # assert numpy frame and input tensors are on shared memory
             assert_ndarray_on_shm(frame)
-            assert pred_results[0].is_shared()
-            assert pred_results[1].is_shared()
+            assert_tensor_on_shm(pred_results[0])
+            assert_tensor_on_shm(pred_results[1])
 
             _t = time.time()
-            # results = model.predict(frame, **gpu_model_cfgs, phase_input=pred_results, phase='postprocess')
-            results = model.predictor.postprocess(pred_results[0], pred_results[1], [frame])
+            # FIXME: directly call model.predictor.postprocess
+            results = model.predict(frame, **gpu_model_cfgs, phase_input=pred_results, phase='postprocess')
+            # results = model.predictor.postprocess(pred_results[0], pred_results[1], [frame])
             if VERBOSE:
                 print(f":: model postprocess took {((time.time() - _t)*1000):.2f}ms")
 
@@ -624,7 +638,7 @@ def yolo_postprocess_worker(stop_event, w_streams: Dict[int, Dict]):
 
 
 def yolo_pipelined_stream(stream: QueuedStream):
-    while not stop_event.is_set() and not stream.stop_event.is_set() and stream.stream_started:
+    while not stop_event.is_set() and not stream.stop_event.is_set():
         try:
             out_frame = stream.output_queue.get(block=True)
         except queue.Empty:
@@ -830,7 +844,7 @@ def init_app():
                 "inference_queue": stream.inference_queue,
                 "model_output_queue": stream.model_output_queue
             } \
-            for key, stream in streams.items() if key in [0]
+            for key, stream in streams.items() if key in [1,2,3]
         }
         Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0", daemon=True, \
              kwargs={"stop_event": stop_event, "device": "npu:0",  "w_streams": w_streams}).start()
