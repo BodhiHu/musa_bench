@@ -25,21 +25,13 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
+from ultralytics.models import yolo
 from screeninfo import get_monitors
 from pathlib import Path
 import threading
 import multiprocessing as mproc
+from multiprocessing import shared_memory as shm
 from musa_bench.mtnn import MtnnYOLOModel
-
-MP_MODE = 'thread' # 'process' or 'thread'
-
-if MP_MODE == 'process':
-    """use processes for multiprocessing"""
-    from multiprocessing import Event, Process as Proc, Queue
-else: # 'thread' mode
-    """ use threads for multiprocessing """
-    from threading import Event, Thread as Proc
-    from queue import Queue
 
 
 DEFAULT_STREAM_URL = "http://192.168.164.136:8686/video"
@@ -52,17 +44,33 @@ IMAGES_PATH = FILE_DIR / "../torch_yolo/images"
 
 device = "musa:0"
 
+DEFAULT_MP_MODE = 'process' # 'process' or 'thread'
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run YOLO detector services")
     parser.add_argument("--live-on-local", action="store_true")
     parser.add_argument("--port", type=int, default=8866)
-    parser.add_argument("--imgsz", type=int, default=640, help="Image size.")
+    parser.add_argument("--imgsz", type=int, default=640, choices=[640, 320],
+                        help="GPU model input tensor size")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--mp-mode", type=str, choices=["thread", "process"], default=DEFAULT_MP_MODE,
+                        help="using threads or processes for parallel processing")
     return parser.parse_args()
 
 args = parse_args()
 if args.verbose:
     VERBOSE = True
+
+if args.mp_mode == 'process':
+    """use processes for multiprocessing"""
+    from multiprocessing import Event, Process as Proc, Queue
+    print("INFO: using multiprocessing for parallel processing")
+else: # 'thread' mode
+    """ use threads for multiprocessing """
+    from threading import Event, Thread as Proc
+    from queue import Queue
+    print("INFO: using threads for parallel processing")
+
 
 model_kwargs = {
     "imgsz"              : args.imgsz,
@@ -139,23 +147,43 @@ def mjpeg_stream_reader(tag = ""):
             print(f"INFO: {tag}closed stream connection")
 
 
-def init_model():
-    print(f"INFO: loading model ...")
+def init_gpu_model(phase):
+    print(f"INFO: loading gpu model ...")
     model = YOLO("yolov8m.pt")
     model.fuse()
     model.model = model.model.half()
     model.model.to(device)
-    print(f"INFO: warming up model ...")
+    print(f"INFO: warming up gpu model ...")
     for _ in range(3):
         model.predict(IMAGES_PATH / "行者 - 1920x1080.jpg", **model_kwargs)
 
     model.predictor._lock = EmptyContextManager()
-    print(f"INFO: model ready ✔")
+    print(f"INFO: gpu model ready ✔")
 
     return model
 
 
-def live_yolo_detect_stream(model: YOLO, loop = False, pos = [0, 0], idx = 0):
+def init_cpu_model():
+    print(f"INFO: loading cpu model ...")
+    model = YOLO("yolov8m.pt")
+    model.fuse()
+    model.model = model.model.half()
+    model.predictor._lock = EmptyContextManager()
+    print(f"INFO: cpu model ready ✔")
+
+    return model
+
+
+def init_npu_model(model_path, core_id):
+    print(f"INFO: loading npu model ...")
+    npu_model = MtnnYOLOModel(model_path, core_id)
+    print(f"INFO: npu model ready ✔")
+    return npu_model
+
+
+def live_yolo_detect_stream(loop = False, pos = [0, 0], idx = 0):
+    model: YOLO = init_gpu_model()
+
     title = f"Live Yolo Detection Stream - {idx}"
     size = get_cv_wind_size()
     cv2.namedWindow(title, cv2.WINDOW_NORMAL)
@@ -213,9 +241,6 @@ def yolo_detect_video(model: YOLO):
     cv2.destroyAllWindows()
 
 
-model = init_model()
-app = FastAPI()
-
 def put_to_queue(tag: str, queue: Queue, data):
     try:
         if queue.full():
@@ -231,11 +256,10 @@ def put_to_queue(tag: str, queue: Queue, data):
 
 
 class QueuedStream:
-    next_stream_idx = 0
 
-    def __init__(self):
-        self.idx                 = QueuedStream.next_stream_idx
-        self.frame_reader_thread = None
+    def __init__(self, idx: int):
+        self.idx                 = idx
+        self.frame_reader_proc = None
         self.stream_started      = False
         self.input_frames_queue  = Queue(maxsize=120)
         self.inference_queue     = Queue(maxsize=30)
@@ -252,12 +276,10 @@ class QueuedStream:
         self.prep_fps            = 0
         self.post_fps            = 0
 
-        QueuedStream.next_stream_idx += 1
-
         print(f"INFO: created new stream = {self.idx}")
 
     def start(self):
-        if self.frame_reader_thread:
+        if self.frame_reader_proc:
             self.stop()
 
         while self.stop_event.is_set():
@@ -275,16 +297,19 @@ class QueuedStream:
                     if self.stop_event.is_set():
                         break
 
+                    # put to shared memory for multi-processing
+                    frame: np.ndarray = torch.from_numpy(frame).share_memory_().numpy()
+                    assert isinstance(frame.base.obj, shm.SharedMemory)
                     put_to_queue(f'input_frames_queue[{self.idx}]', self.input_frames_queue, frame)
 
             print(f"INFO: stream[{self.idx}] frames input worker will stop")
             self.stop_event.clear()
-            self.frame_reader_thread = None
+            self.frame_reader_proc = None
 
-        self.frame_reader_thread = threading.Thread(
+        self.frame_reader_proc = mproc.Process(
             target=frame_read_worker, name=f"frame_read_worker[{self.idx}]", daemon=True
         )
-        self.frame_reader_thread.start()
+        self.frame_reader_proc.start()
         self.stream_started = True
 
     def stop(self):
@@ -293,14 +318,14 @@ class QueuedStream:
 
 
 streams: Dict[int, QueuedStream] = {
-    0: QueuedStream(),
-    1: QueuedStream(),
-    2: QueuedStream(),
-    3: QueuedStream(),
-    # 4: QueuedStream(),
-    # 5: QueuedStream(),
-    # 6: QueuedStream(),
-    # 7: QueuedStream(),
+    0: QueuedStream(0),
+    1: QueuedStream(1),
+    2: QueuedStream(2),
+    3: QueuedStream(3),
+    # 4: QueuedStream(4),
+    # 5: QueuedStream(5),
+    # 6: QueuedStream(6),
+    # 7: QueuedStream(7),
 }
 
 device_stats = {
@@ -327,6 +352,8 @@ def exit_on_error(func):
 
 
 def yolo_preprocess_worker():
+    model: YOLO = init_cpu_model()
+
     while not stop_event.is_set():
         empty = True
 
@@ -334,25 +361,29 @@ def yolo_preprocess_worker():
             start_time = time.time()
 
             try:
-                frame = stream.input_frames_queue.get(block=False)
+                frame: np.ndarray = stream.input_frames_queue.get(block=False)
                 if frame is None:
                     continue
             except queue.Empty:
                 continue
+
+            assert isinstance(frame.base.obj, shm.SharedMemory)
 
             empty = False
 
             kwargs = dict(model_kwargs)
             # Tensor of shape [1, 3, 192, 320]
             _t = time.time()
-            tensors: List[torch.Tensor] = model.predict(frame, phase='preprocess', **kwargs)
+            preds_tensor: torch.Tensor = model.predict(frame, phase='preprocess', **kwargs)[0]
+            assert preds_tensor.device.type == 'cpu'
+            preds_tensor = preds_tensor.share_memory_()
+            gpu_tensors = [preds_tensor]
             if VERBOSE:
                 print(f":: model preprocess took {((time.time() - _t)*1000):.2f}ms")
-            assert tensors[0].device.type == 'cpu'
 
             # pad for NPU #############################################################################
             """center and reshape to 640x640"""
-            # **MUST SET to 640** for NPU inference, no limits for GPU
+            # **MUST RESHAPE to 640x640** for NPU inference, no limits for GPU
             kwargs["imgsz"] = 640
             npu_tensors: List[torch.Tensor] = model.predict(frame, phase='preprocess', **kwargs)
             assert npu_tensors[0].device.type == 'cpu'
@@ -369,10 +400,13 @@ def yolo_preprocess_worker():
             # Apply padding: (left, right, top, bottom)
             tensor = nnf.pad(npu_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
             assert tensor.device.type == 'cpu'
-            npu_tensors = [tensor.to(torch.float32).contiguous()]
+            npu_tensors = [tensor.to(torch.float32).contiguous().share_memory_()]
             ###########################################################################################
 
-            data = (frame, tensors, npu_tensors)
+            data = (frame, gpu_tensors, npu_tensors)
+            assert isinstance(frame.base.obj, shm.SharedMemory)
+            assert gpu_tensors[0].is_shared()
+            assert npu_tensors[0].is_shared()
             put_to_queue(f"inference_queue[{s_idx}]", stream.inference_queue, data)
 
             delta = time.time() - start_time
@@ -385,12 +419,14 @@ def yolo_preprocess_worker():
 def yolo_inference_worker(device="musa:0", stream_ids=[]):
     dev_type, dev_id = device.split(":")
     dev_id = int(dev_id)
-    gpu_model = model
+    gpu_model = None
     npu_model = None
 
-
     if dev_type == 'npu' and npu_model is None:
-        npu_model = MtnnYOLOModel("./assets/mtnn/yolov8m_quantized.nb", dev_id)
+        npu_model = init_npu_model("./assets/mtnn/yolov8m_quantized.nb", dev_id)
+
+    if dev_type == 'musa' and gpu_model is None:
+        gpu_model = init_gpu_model()
 
     while not stop_event.is_set():
         empty = True
@@ -400,13 +436,15 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
                 continue
 
             try:
-                (frame, input_tensors, npu_tensors) = stream.inference_queue.get(block=False)
+                (frame, input_tensors, npu_input_tensors) = stream.inference_queue.get(block=False)
                 empty = False
             except queue.Empty:
                 continue
 
-            # print(">>>>> predict input:")
-            # print_nested_types(input_tensors)
+            # assert numpy frame and input tensors are on shared memory
+            assert isinstance(frame.base.obj, shm.SharedMemory)
+            assert input_tensors[0].is_shared()
+            assert npu_input_tensors[0].is_shared()
 
             gpu_results = None
             npu_results = None
@@ -425,7 +463,7 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
 
                 assert preds_tensor.device.type == 'musa'
                 assert input_tensor.device.type == 'musa'
-                gpu_results = [preds_tensor, input_tensor]
+                gpu_results = [preds_tensor.cpu().share_memory_(), input_tensors[0]]
 
                 stream.model_fps = 1 / (time.time() - start_time)
                 device_stats[f"{device}:model_fps"] = stream.model_fps
@@ -435,10 +473,9 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
             elif dev_type == 'npu':
 
                 npu_start = time.time()
-                npu_input_tensor: torch.Tensor = npu_tensors[0]
-                npu_outs: List[np.ndarray] = npu_model(npu_input_tensor.numpy())
+                npu_outs: List[np.ndarray] = npu_model(npu_input_tensors[0].numpy())
                 npu_preds_tensor = torch.from_numpy(npu_outs[0])
-                npu_results = [npu_preds_tensor, npu_input_tensor]
+                npu_results = [npu_preds_tensor.share_memory_(), npu_input_tensors[0]]
 
                 stream.npu_model_fps = 1 / (time.time() - npu_start)
                 device_stats[f"{device}:model_fps"] = stream.npu_model_fps
@@ -452,6 +489,11 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
                 os._exit(-1)
 
             data = (frame, gpu_results, npu_results)
+            assert isinstance(frame.base.obj, shm.SharedMemory)
+            assert gpu_results[0].is_shared()
+            assert gpu_results[1].is_shared()
+            assert npu_results[0].is_shared()
+            assert npu_results[1].is_shared()
             put_to_queue(f"model_output_queue[{s_idx}]", stream.model_output_queue, data)
 
         if empty:
@@ -460,6 +502,7 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
 
 
 def yolo_postprocess_worker():
+    model = init_cpu_model()
     processed = 0
     delta_thres = 1000 / 1000 # 80ms
 
@@ -482,10 +525,16 @@ def yolo_postprocess_worker():
                 continue
 
             device = 'GPU' if gpu_results is not None else 'NPU'
-            phase_input = gpu_results or npu_results
-            assert phase_input is not None
+            pred_results = gpu_results or npu_results
+
+            assert pred_results is not None
+            # assert numpy frame and input tensors are on shared memory
+            assert isinstance(frame.base.obj, shm.SharedMemory)
+            assert pred_results[0].is_shared()
+            assert pred_results[1].is_shared()
+
             _t = time.time()
-            results = model.predict(frame, **model_kwargs, phase_input=phase_input, phase='postprocess')
+            results = model.predict(frame, **model_kwargs, phase_input=pred_results, phase='postprocess')
             if VERBOSE:
                 print(f":: model postprocess took {((time.time() - _t)*1000):.2f}ms")
 
@@ -501,8 +550,10 @@ def yolo_postprocess_worker():
             if not ret:
                 continue
 
-            frame_bytes = jpeg.tobytes()
-            put_to_queue(f"output_queue[{s_idx}]", stream.output_queue, frame_bytes)
+            out_frame = torch.from_numpy(jpeg).share_memory_().numpy()
+            # out_frame = jpeg.tobytes()
+            assert isinstance(out_frame.base.obj, shm.SharedMemory)
+            put_to_queue(f"output_queue[{s_idx}]", stream.output_queue, out_frame)
 
             # calculate fps ############################################################
             processed += 1
@@ -533,13 +584,18 @@ def yolo_postprocess_worker():
 def yolo_pipelined_stream(stream: QueuedStream):
     while not stop_event.is_set() and not stream.stop_event.is_set() and stream.stream_started:
         try:
-            frame_bytes = stream.output_queue.get(block=True)
+            out_frame = stream.output_queue.get(block=True)
         except queue.Empty:
             sleep_ms(10)
             continue
 
+        if isinstance(out_frame, np.ndarray):
+            out_frame = out_frame.tobytes()
+
+        assert isinstance(out_frame, bytes)
+
         yield (b"--frame\r\n"
-               b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+               b"Content-Type: image/jpeg\r\n\r\n" + out_frame + b"\r\n")
 
 
 def yolo_synced_stream():
@@ -619,119 +675,126 @@ class YoloLiveMode(str, Enum):
     sync      = "sync"
     pipelined = "pipelined"
 
-@app.get("/video/sync/{index}")
-def yolo_sync(index: int = 0):
-    return StreamingResponse(yolo_synced_stream(), media_type='multipart/x-mixed-replace; boundary=frame')
 
-@app.get("/video/pipelined/{index}")
-def yolo_pipelined(index: int = 0):
-    print(f"INFO: stream[{index}] starting ...")
-    stream = streams[index]
-    stream.start()
-    print(f"INFO: stream[{index}] started")
-    res = StreamingResponse(yolo_pipelined_stream(stream), media_type='multipart/x-mixed-replace; boundary=frame')
+def init_app():
 
-    # def on_close():
-    #     print(f"INFO: stream[{index}] stopping ...")
-    #     stream.stop()
-    #     print(f"INFO: stream[{index}] stopped")
-    # res.background = BackgroundTask(on_close)
+    app = FastAPI()
 
-    return res
+    @app.get("/video/sync/{index}")
+    def yolo_sync(index: int = 0):
+        return StreamingResponse(yolo_synced_stream(), media_type='multipart/x-mixed-replace; boundary=frame')
 
-@app.get("/", response_class=HTMLResponse)
-def index(streams: int = Query(1), mode: YoloLiveMode = Query(YoloLiveMode.pipelined)):
-    return """
-    <html>
-    <head>
-        <title>YOLO Live</title>
-        <style>
-            .live-videos {
-                width: 100%;
-                display: flex;
-                flex-direction: row;
-                justify-content: flex-start;
-                align-items: flex-start;
-                gap: 8px;
-                flex-wrap: wrap;
-            }
-            .live-videos img {
-                max-width: calc(50% - 8px);
-            }
-        </style>
-    """ + \
-    f"""
+    @app.get("/video/pipelined/{index}")
+    def yolo_pipelined(index: int = 0):
+        print(f"INFO: stream[{index}] starting ...")
+        stream = streams[index]
+        stream.start()
+        print(f"INFO: stream[{index}] started")
+        res = StreamingResponse(yolo_pipelined_stream(stream), media_type='multipart/x-mixed-replace; boundary=frame')
+
+        # def on_close():
+        #     print(f"INFO: stream[{index}] stopping ...")
+        #     stream.stop()
+        #     print(f"INFO: stream[{index}] stopped")
+        # res.background = BackgroundTask(on_close)
+
+        return res
+
+    @app.get("/", response_class=HTMLResponse)
+    def index(streams: int = Query(1), mode: YoloLiveMode = Query(YoloLiveMode.pipelined)):
+        return """
+        <html>
+        <head>
+            <title>YOLO Live</title>
+            <style>
+                .live-videos {
+                    width: 100%;
+                    display: flex;
+                    flex-direction: row;
+                    justify-content: flex-start;
+                    align-items: flex-start;
+                    gap: 8px;
+                    flex-wrap: wrap;
+                }
+                .live-videos img {
+                    max-width: calc(50% - 8px);
+                }
+            </style>
+        """ + \
+        f"""
+            <script>
+                var yolo_mode = "{mode}"
+                var streams = {streams};
+            </script>
+        """ + \
+        """
+        </head>
+        <body style="text-align:center;">
+            <h2 style="">YOLO Live</h2>
+            <div class="live-videos">
+                """ + \
+                f"""
+                <img alt="image" src="/video/{mode}/0" />
+                """ + \
+                """
+            </div>
+        </body>
         <script>
-            var yolo_mode = "{mode}"
-            var streams = {streams};
-        </script>
-    """ + \
-    """
-    </head>
-    <body style="text-align:center;">
-        <h2 style="">YOLO Live</h2>
-        <div class="live-videos">
-            """ + \
-            f"""
-            <img alt="image" src="/video/{mode}/0" />
-            """ + \
-            """
-        </div>
-    </body>
-    <script>
-        let img0 = document.querySelector('.live-videos > img')
-        let new_img = img0.cloneNode()
-        img0.onload = function() {
-            for (let i = 1; i < streams; i++) {
-                setTimeout(() => {
-                    img = new_img.cloneNode()
-                    img.src = `/video/${yolo_mode}/${i}`
-                    img0.parentElement.append(img)
-                }, 3000 * i);
+            let img0 = document.querySelector('.live-videos > img')
+            let new_img = img0.cloneNode()
+            img0.onload = function() {
+                for (let i = 1; i < streams; i++) {
+                    setTimeout(() => {
+                        img = new_img.cloneNode()
+                        img.src = `/video/${yolo_mode}/${i}`
+                        img0.parentElement.append(img)
+                    }, 3000 * i);
+                }
             }
-        }
-    </script>
-    </html>
-    """
+        </script>
+        </html>
+        """
 
 
-@app.on_event("startup")
-def start_threads():
-    """preprocess workers"""
-    Proc(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
-                     daemon=True).start()
-    # Proc(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
-    #                  daemon=True).start()
+    @app.on_event("startup")
+    def start_threads():
+        """preprocess workers"""
+        Proc(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
+                         daemon=True).start()
+        # Proc(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
+        #                  daemon=True).start()
 
-    stream_ids = []
-    """inference workers"""
-    stream_ids = [0]
-    Proc(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0", \
-                     daemon=True, kwargs={"device": "musa:0", "stream_ids": stream_ids}).start()
-    stream_ids = [1,2,3]
-    Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0", \
-                     daemon=True, kwargs={"device": "npu:0",  "stream_ids": stream_ids}).start()
-    stream_ids = [1,2,3]
-    Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1", \
-                     daemon=True, kwargs={"device": "npu:1",  "stream_ids": stream_ids}).start()
+        stream_ids = []
+        """inference workers"""
+        stream_ids = [0]
+        Proc(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0", \
+                         daemon=True, kwargs={"device": "musa:0", "stream_ids": stream_ids}).start()
+        stream_ids = [1,2,3]
+        Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0", \
+                         daemon=True, kwargs={"device": "npu:0",  "stream_ids": stream_ids}).start()
+        stream_ids = [1,2,3]
+        Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1", \
+                         daemon=True, kwargs={"device": "npu:1",  "stream_ids": stream_ids}).start()
 
-    """postprocess workers"""
-    Proc(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
-                     daemon=True).start()
-    # Proc(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
-    #                  daemon=True).start()
+        """postprocess workers"""
+        Proc(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
+                         daemon=True).start()
+        # Proc(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
+        #                  daemon=True).start()
 
 
-@app.on_event("shutdown")
-def shutdown():
-    stop_event.set()
-    exit(0)
+    @app.on_event("shutdown")
+    def shutdown():
+        stop_event.set()
+        exit(0)
+
+    return app
 
 
 if __name__ == "__main__":
 
     if args.live_on_local:
-        live_yolo_detect_stream(model, loop=True, pos=[5, 5])
+        live_yolo_detect_stream(loop=True, pos=[5, 5])
     else:
-        uvicorn.run(app, host="0.0.0.0", port=args.port, reload=False)
+        uvicorn.run(init_app(), host="0.0.0.0", port=args.port, reload=False)
 
