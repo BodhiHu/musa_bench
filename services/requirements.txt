@@ -2,3 +2,4 @@ uvicorn
 fastapi
 screeninfo
 opencv-python
+ffmpeg-python

@@ -29,8 +29,17 @@ from screeninfo import get_monitors
 from pathlib import Path
 import threading
 import multiprocessing as mproc
-from multiprocessing import shared_memory
 from musa_bench.mtnn import MtnnYOLOModel
+
+MP_MODE = 'thread' # 'process' or 'thread'
+
+if MP_MODE == 'process':
+    """use processes for multiprocessing"""
+    from multiprocessing import Event, Process as Proc, Queue
+else: # 'thread' mode
+    """ use threads for multiprocessing """
+    from threading import Event, Thread as Proc
+    from queue import Queue
 
 
 DEFAULT_STREAM_URL = "http://192.168.164.136:8686/video"
@@ -207,7 +216,7 @@ def yolo_detect_video(model: YOLO):
 model = init_model()
 app = FastAPI()
 
-def put_to_queue(tag: str, queue: queue.Queue, data):
+def put_to_queue(tag: str, queue: Queue, data):
     try:
         if queue.full():
             # print(f"WARNING: [{tag}] is full, will remove and skip the first frame in queue")
@@ -228,11 +237,11 @@ class QueuedStream:
         self.idx                 = QueuedStream.next_stream_idx
         self.frame_reader_thread = None
         self.stream_started      = False
-        self.input_frames_queue  = queue.Queue(maxsize=120)
-        self.inference_queue     = queue.Queue(maxsize=30)
-        self.model_output_queue  = queue.Queue(maxsize=30)
-        self.output_queue        = queue.Queue(maxsize=30)
-        self.stop_event          = threading.Event()
+        self.input_frames_queue  = Queue(maxsize=120)
+        self.inference_queue     = Queue(maxsize=30)
+        self.model_output_queue  = Queue(maxsize=30)
+        self.output_queue        = Queue(maxsize=30)
+        self.stop_event          = Event()
 
         self.processed_frames    = 0
         self.total_time          = 0
@@ -303,7 +312,7 @@ device_stats = {
 def active_streams():
     return {k: v for k, v in streams.items() if v.stream_started}
 
-stop_event = threading.Event()
+stop_event = Event()
 
 
 def exit_on_error(func):
@@ -689,27 +698,27 @@ def index(streams: int = Query(1), mode: YoloLiveMode = Query(YoloLiveMode.pipel
 @app.on_event("startup")
 def start_threads():
     """preprocess workers"""
-    threading.Thread(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
+    Proc(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
                      daemon=True).start()
-    # threading.Thread(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
+    # Proc(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
     #                  daemon=True).start()
 
     stream_ids = []
     """inference workers"""
-    # stream_ids = [0,1]
-    threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0", \
+    stream_ids = [0]
+    Proc(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0", \
                      daemon=True, kwargs={"device": "musa:0", "stream_ids": stream_ids}).start()
-    # stream_ids = [0,1]
-    threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0", \
+    stream_ids = [1,2,3]
+    Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0", \
                      daemon=True, kwargs={"device": "npu:0",  "stream_ids": stream_ids}).start()
-    # stream_ids = [2,3]
-    threading.Thread(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1", \
+    stream_ids = [1,2,3]
+    Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1", \
                      daemon=True, kwargs={"device": "npu:1",  "stream_ids": stream_ids}).start()
 
     """postprocess workers"""
-    threading.Thread(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
+    Proc(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
                      daemon=True).start()
-    # threading.Thread(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
+    # Proc(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
     #                  daemon=True).start()
 
 
