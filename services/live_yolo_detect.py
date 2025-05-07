@@ -1,3 +1,4 @@
+import signal
 import os, sys
 import traceback
 
@@ -72,7 +73,9 @@ else: # 'thread' mode
     print("INFO: using threads for parallel processing")
 
 
-model_kwargs = {
+mproc_states_manager = mproc.Manager()
+
+gpu_model_cfgs = {
     "imgsz"              : args.imgsz,
     "half"               : True,
     "device"             : device,
@@ -81,6 +84,14 @@ model_kwargs = {
     "postprocess_device" : "cpu",
     "verbose"            : VERBOSE
 }
+
+npu_model_cfgs = dict(gpu_model_cfgs)
+npu_model_cfgs["imgsz"] = 640
+npu_model_cfgs["half"] = False
+
+cpu_model_cfgs = dict(gpu_model_cfgs)
+cpu_model_cfgs["device"] = "cpu"
+cpu_model_cfgs["half"] = False
 
 
 class EmptyContextManager:
@@ -147,15 +158,16 @@ def mjpeg_stream_reader(tag = ""):
             print(f"INFO: {tag}closed stream connection")
 
 
-def init_gpu_model(phase):
+def init_gpu_model():
     print(f"INFO: loading gpu model ...")
     model = YOLO("yolov8m.pt")
     model.fuse()
     model.model = model.model.half()
     model.model.to(device)
+
     print(f"INFO: warming up gpu model ...")
-    for _ in range(3):
-        model.predict(IMAGES_PATH / "行者 - 1920x1080.jpg", **model_kwargs)
+    for _ in range(1):
+        model.predict(IMAGES_PATH / "行者 - 1920x1080.jpg", **gpu_model_cfgs)
 
     model.predictor._lock = EmptyContextManager()
     print(f"INFO: gpu model ready ✔")
@@ -166,9 +178,13 @@ def init_gpu_model(phase):
 def init_cpu_model():
     print(f"INFO: loading cpu model ...")
     model = YOLO("yolov8m.pt")
+    model.to("cpu")
     model.fuse()
-    model.model = model.model.half()
-    model.predictor._lock = EmptyContextManager()
+
+    print(f"INFO: warming up cpu model ...")
+    for _ in range(1):
+        model.predict(IMAGES_PATH / "行者 - 1920x1080.jpg", **cpu_model_cfgs)
+
     print(f"INFO: cpu model ready ✔")
 
     return model
@@ -255,11 +271,15 @@ def put_to_queue(tag: str, queue: Queue, data):
         print(f"WARNING: [{tag}] put to queue faield, ignoring:", exc)
 
 
+def assert_ndarray_on_shm(nd: np.ndarray):
+    assert not nd.flags.owndata
+
+
 class QueuedStream:
 
     def __init__(self, idx: int):
         self.idx                 = idx
-        self.frame_reader_proc = None
+        self.frame_reader_proc   = None
         self.stream_started      = False
         self.input_frames_queue  = Queue(maxsize=120)
         self.inference_queue     = Queue(maxsize=30)
@@ -267,16 +287,28 @@ class QueuedStream:
         self.output_queue        = Queue(maxsize=30)
         self.stop_event          = Event()
 
-        self.processed_frames    = 0
-        self.total_time          = 0
-        self.last_time           = None
-        self.fps                 = 0
-        self.model_fps           = 0
-        self.npu_model_fps       = 0
-        self.prep_fps            = 0
-        self.post_fps            = 0
+        self.stats               = mproc_states_manager.dict({
 
-        print(f"INFO: created new stream = {self.idx}")
+            "processed_frames"   : 0,
+            "total_time"         : 0,
+            "last_time"          : None,
+            "fps"                : 0,
+            "model_fps"          : 0,
+            "npu_model_fps"      : 0,
+            "prep_fps"           : 0,
+            "post_fps"           : 0,
+        })
+
+        # self.processed_frames    = 0
+        # self.total_time          = 0
+        # self.last_time           = None
+        # self.fps                 = 0
+        # self.model_fps           = 0
+        # self.npu_model_fps       = 0
+        # self.prep_fps            = 0
+        # self.post_fps            = 0
+
+        print(f"INFO: created stream = {self.idx}")
 
     def start(self):
         if self.frame_reader_proc:
@@ -288,34 +320,38 @@ class QueuedStream:
 
         print(f"INFO: stream[{self.idx}] starting frames input worker ...")
 
-        def frame_read_worker():
-            while not self.stop_event.is_set():
-                for frame in mjpeg_stream_reader(f"stream[{self.idx}] "):
+        def frame_read_worker(idx: int, input_frames_queue: Queue, stop_event):
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+            while not stop_event.is_set():
+                for frame in mjpeg_stream_reader(f"stream[{idx}] "):
                     if frame is None:
                         continue
 
-                    if self.stop_event.is_set():
+                    if stop_event.is_set():
                         break
 
                     # put to shared memory for multi-processing
                     frame: np.ndarray = torch.from_numpy(frame).share_memory_().numpy()
-                    assert isinstance(frame.base.obj, shm.SharedMemory)
-                    put_to_queue(f'input_frames_queue[{self.idx}]', self.input_frames_queue, frame)
+                    assert_ndarray_on_shm(frame)
+                    put_to_queue(f'input_frames_queue[{self.idx}]', input_frames_queue, frame)
 
             print(f"INFO: stream[{self.idx}] frames input worker will stop")
-            self.stop_event.clear()
-            self.frame_reader_proc = None
+            stop_event.clear()
 
         self.frame_reader_proc = mproc.Process(
-            target=frame_read_worker, name=f"frame_read_worker[{self.idx}]", daemon=True
+            target=frame_read_worker, name=f"frame_read_worker[{self.idx}]", daemon=True,
+            kwargs={ "idx": self.idx, "input_frames_queue": self.input_frames_queue, "stop_event": self.stop_event }
         )
         self.frame_reader_proc.start()
         self.stream_started = True
 
     def stop(self):
         self.stop_event.set()
+        if self.frame_reader_proc:
+            self.frame_reader_proc.kill()
+            self.frame_reader_proc = None
         self.stream_started = False
-
 
 streams: Dict[int, QueuedStream] = {
     0: QueuedStream(0),
@@ -328,11 +364,11 @@ streams: Dict[int, QueuedStream] = {
     # 7: QueuedStream(7),
 }
 
-device_stats = {
+device_stats = mproc_states_manager.dict({
     "musa:0:model_fps" : 0,
     "npu:0:model_fps"  : 0,
     "npu:1:model_fps"  : 0,
-}
+})
 
 def active_streams():
     return {k: v for k, v in streams.items() if v.stream_started}
@@ -351,43 +387,48 @@ def exit_on_error(func):
     return wrapper
 
 
-def yolo_preprocess_worker():
+def yolo_preprocess_worker(stop_event, w_streams: Dict[int, Dict]):
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     model: YOLO = init_cpu_model()
 
     while not stop_event.is_set():
         empty = True
 
-        for s_idx, stream in active_streams().items():
+        for s_idx, w_stream in w_streams.items():
             start_time = time.time()
 
             try:
-                frame: np.ndarray = stream.input_frames_queue.get(block=False)
+                frame: np.ndarray = w_stream["input_frames_queue"].get(block=False)
                 if frame is None:
                     continue
             except queue.Empty:
                 continue
 
-            assert isinstance(frame.base.obj, shm.SharedMemory)
+            assert_ndarray_on_shm(frame)
 
             empty = False
 
-            kwargs = dict(model_kwargs)
             # Tensor of shape [1, 3, 192, 320]
             _t = time.time()
-            preds_tensor: torch.Tensor = model.predict(frame, phase='preprocess', **kwargs)[0]
-            assert preds_tensor.device.type == 'cpu'
-            preds_tensor = preds_tensor.share_memory_()
-            gpu_tensors = [preds_tensor]
+            # preds_tensor: torch.Tensor = model.predict(frame, phase='preprocess', **gpu_model_cfgs)[0]
+            prep_tensor: torch.Tensor = model.predictor.preprocess(frame, **gpu_model_cfgs)
+            assert prep_tensor.device.type == 'cpu'
+            prep_tensor = prep_tensor.share_memory_()
+            gpu_tensors = [prep_tensor]
             if VERBOSE:
                 print(f":: model preprocess took {((time.time() - _t)*1000):.2f}ms")
 
             # pad for NPU #############################################################################
             """center and reshape to 640x640"""
             # **MUST RESHAPE to 640x640** for NPU inference, no limits for GPU
-            kwargs["imgsz"] = 640
-            npu_tensors: List[torch.Tensor] = model.predict(frame, phase='preprocess', **kwargs)
-            assert npu_tensors[0].device.type == 'cpu'
-            npu_tensor = npu_tensors[0]
+            # npu_tensor: torch.Tensor = model.predict(frame, phase='preprocess', **npu_model_cfgs)[0]
+            # npu_tensor = npu_tensor.float()
+            npu_tensor: torch.Tensor = model.predictor.preprocess(frame, **npu_model_cfgs)
+            assert npu_tensor.device.type == 'cpu'
+            assert npu_tensor.dtype == torch.float32
+            assert npu_tensor.shape[-1] == 640
+            npu_tensor = npu_tensor
             target_h, target_w = 640, 640
             h, w = npu_tensor.shape[2], npu_tensor.shape[3]
             # Compute padding
@@ -400,23 +441,25 @@ def yolo_preprocess_worker():
             # Apply padding: (left, right, top, bottom)
             tensor = nnf.pad(npu_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
             assert tensor.device.type == 'cpu'
-            npu_tensors = [tensor.to(torch.float32).contiguous().share_memory_()]
+            npu_tensors = [tensor.contiguous().share_memory_()]
             ###########################################################################################
 
             data = (frame, gpu_tensors, npu_tensors)
-            assert isinstance(frame.base.obj, shm.SharedMemory)
+            assert_ndarray_on_shm(frame)
             assert gpu_tensors[0].is_shared()
             assert npu_tensors[0].is_shared()
-            put_to_queue(f"inference_queue[{s_idx}]", stream.inference_queue, data)
+            put_to_queue(f"inference_queue[{s_idx}]", w_stream["inference_queue"], data)
 
             delta = time.time() - start_time
-            stream.prep_fps = 1 / delta
+            streams[s_idx].stats["prep_fps"] = 1 / delta
 
         if empty:
             sleep_ms(10)
 
 @exit_on_error
-def yolo_inference_worker(device="musa:0", stream_ids=[]):
+def yolo_inference_worker(stop_event, device: str, w_streams: Dict[int, Dict]):
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     dev_type, dev_id = device.split(":")
     dev_id = int(dev_id)
     gpu_model = None
@@ -431,18 +474,16 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
     while not stop_event.is_set():
         empty = True
 
-        for s_idx, stream in active_streams().items():
-            if len(stream_ids) > 0 and s_idx not in stream_ids:
-                continue
+        for s_idx, w_stream in w_streams.items():
 
             try:
-                (frame, input_tensors, npu_input_tensors) = stream.inference_queue.get(block=False)
+                (frame, input_tensors, npu_input_tensors) = w_stream["inference_queue"].get(block=False)
                 empty = False
             except queue.Empty:
                 continue
 
             # assert numpy frame and input tensors are on shared memory
-            assert isinstance(frame.base.obj, shm.SharedMemory)
+            assert_ndarray_on_shm(frame)
             assert input_tensors[0].is_shared()
             assert npu_input_tensors[0].is_shared()
 
@@ -451,7 +492,7 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
             if dev_type == 'musa':
 
                 start_time = time.time()
-                # results = gpu_model.predict(frame, **model_kwargs, phase_input=input_tensors, phase='inference')
+                # results = gpu_model.predict(frame, **gpu_model_cfgs, phase_input=input_tensors, phase='inference')
                 # preds_tensor: torch.Tensor = results[0][0]
                 # input_tensor: torch.Tensor = results[1]
                 input_tensor: torch.Tensor = input_tensors[0].to(device)
@@ -465,8 +506,8 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
                 assert input_tensor.device.type == 'musa'
                 gpu_results = [preds_tensor.cpu().share_memory_(), input_tensors[0]]
 
-                stream.model_fps = 1 / (time.time() - start_time)
-                device_stats[f"{device}:model_fps"] = stream.model_fps
+                streams[s_idx].stats["model_fps"] = 1 / (time.time() - start_time)
+                device_stats[f"{device}:model_fps"] = streams[s_idx].stats["model_fps"]
                 # print(">>>>> GPU predict results and input:")
                 # print_nested_types(gpu_results)
 
@@ -477,31 +518,32 @@ def yolo_inference_worker(device="musa:0", stream_ids=[]):
                 npu_preds_tensor = torch.from_numpy(npu_outs[0])
                 npu_results = [npu_preds_tensor.share_memory_(), npu_input_tensors[0]]
 
-                stream.npu_model_fps = 1 / (time.time() - npu_start)
-                device_stats[f"{device}:model_fps"] = stream.npu_model_fps
+                streams[s_idx].stats["npu_model_fps"] = 1 / (time.time() - npu_start)
+                device_stats[f"{device}:model_fps"] = streams[s_idx].stats["npu_model_fps"]
 
                 # print(">>>>> NPU predict results and input:")
                 # print_nested_types(npu_results)
                 # print(">>>>> NPU predict outs:")
                 # print_nested_types(npu_outs)
             else:
-                print(f"ERROR: can't decide which device to run for stream[{s_idx}]: device = {device}, stream_ids = {stream_ids}")
+                print(f"ERROR: can't decide which device to run for stream[{s_idx}]: device = {device}, stream_ids = {s_idx}")
                 os._exit(-1)
 
             data = (frame, gpu_results, npu_results)
-            assert isinstance(frame.base.obj, shm.SharedMemory)
+            assert_ndarray_on_shm(frame)
             assert gpu_results[0].is_shared()
             assert gpu_results[1].is_shared()
             assert npu_results[0].is_shared()
             assert npu_results[1].is_shared()
-            put_to_queue(f"model_output_queue[{s_idx}]", stream.model_output_queue, data)
+            put_to_queue(f"model_output_queue[{s_idx}]", w_stream["model_output_queue"], data)
 
         if empty:
-            # print("WARN: all stream inference queues are empty, will wait 10ms for new requests")
             sleep_ms(10)
 
 
-def yolo_postprocess_worker():
+def yolo_postprocess_worker(stop_event, w_streams: Dict[int, Dict]):
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     model = init_cpu_model()
     processed = 0
     delta_thres = 1000 / 1000 # 80ms
@@ -512,14 +554,13 @@ def yolo_postprocess_worker():
         total_fps = 0
         total_model_fps = sum(value for key, value in device_stats.items() if key.endswith(":model_fps"))
 
-        _active_streams = active_streams()
-        for s_idx, stream in _active_streams.items():
+        for s_idx, w_stream in w_streams.items():
 
             start_time = time.time()
-            total_fps += stream.fps
+            total_fps += streams[s_idx].stats["fps"]
 
             try:
-                (frame, gpu_results, npu_results) = stream.model_output_queue.get(block=False)
+                (frame, gpu_results, npu_results) = w_stream["model_output_queue"].get(block=False)
                 empty = False
             except queue.Empty:
                 continue
@@ -529,19 +570,20 @@ def yolo_postprocess_worker():
 
             assert pred_results is not None
             # assert numpy frame and input tensors are on shared memory
-            assert isinstance(frame.base.obj, shm.SharedMemory)
+            assert_ndarray_on_shm(frame)
             assert pred_results[0].is_shared()
             assert pred_results[1].is_shared()
 
             _t = time.time()
-            results = model.predict(frame, **model_kwargs, phase_input=pred_results, phase='postprocess')
+            # results = model.predict(frame, **gpu_model_cfgs, phase_input=pred_results, phase='postprocess')
+            results = model.predictor.postprocess(pred_results[0], pred_results[1], [frame])
             if VERBOSE:
                 print(f":: model postprocess took {((time.time() - _t)*1000):.2f}ms")
 
             annotated_frame = results[0].plot()
 
             # fps_text = f"{device} fps: {stream.fps:.2f} total_model_fps: {total_model_fps:.2f}"
-            fps_text = f"gpu_fps: {stream.model_fps:.2f} npu_fps: {stream.npu_model_fps:.2f} total_model_fps: {total_model_fps:.2f}"
+            fps_text = f"{device} gpu_fps: {streams[s_idx].stats['model_fps']:.2f} npu_fps: {streams[s_idx].stats['npu_model_fps']:.2f} total_model_fps: {total_model_fps:.2f}"
             cv2.putText(annotated_frame, fps_text, (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
@@ -552,28 +594,28 @@ def yolo_postprocess_worker():
 
             out_frame = torch.from_numpy(jpeg).share_memory_().numpy()
             # out_frame = jpeg.tobytes()
-            assert isinstance(out_frame.base.obj, shm.SharedMemory)
-            put_to_queue(f"output_queue[{s_idx}]", stream.output_queue, out_frame)
+            assert_ndarray_on_shm(out_frame)
+            put_to_queue(f"output_queue[{s_idx}]", w_stream["output_queue"], out_frame)
 
             # calculate fps ############################################################
             processed += 1
             if processed > 10:
                 delta = 0
                 cur_time = time.time()
-                if stream.last_time is not None:
-                    delta = cur_time - stream.last_time
-                stream.last_time = cur_time
-                stream.post_fps = 1 / (cur_time - start_time)
+                if streams[s_idx].stats["last_time"] is not None:
+                    delta = cur_time - streams[s_idx].stats["last_time"]
+                streams[s_idx].stats["last_time"] = cur_time
+                streams[s_idx].stats["post_fps"] = 1 / (cur_time - start_time)
                 # skip frames that comes in late due to bad network condition .etc
                 if delta > 0 and delta < delta_thres:
                     # stream.total_time += delta
                     # stream.processed_frames += 1
                     # stream.fps = stream.processed_frames / stream.total_time
-                    stream.fps = 1 / delta
+                    streams[s_idx].stats["fps"] = 1 / delta
                 if VERBOSE:
-                    print(f"<- stream[{s_idx}] [{device}] outcoming fps = {stream.fps:.2f}, prep_fps = {stream.prep_fps:.2f}, gpu_model_fps = {stream.model_fps:.2f}, npu_model_fps = {stream.npu_model_fps:.2f}, post_fps = {stream.post_fps:.2f}")
+                    print(f"<- stream[{s_idx}] [{device}] outcoming fps = {streams[s_idx].stats['fps']:.2f}, prep_fps = {streams[s_idx].stats['prep_fps']:.2f}, gpu_model_fps = {streams[s_idx].stats['model_fps']:.2f}, npu_model_fps = {streams[s_idx].stats['npu_model_fps']:.2f}, post_fps = {streams[s_idx].stats['post_fps']:.2f}")
 
-                    if s_idx == (len(_active_streams)-1):
+                    if s_idx == (len(w_streams)-1):
                         print(f"total_fps = {total_fps:.2f}, total_model_fps = {total_model_fps:.2f}")
             ############################################################################
 
@@ -599,6 +641,8 @@ def yolo_pipelined_stream(stream: QueuedStream):
 
 
 def yolo_synced_stream():
+    model = init_gpu_model()
+
     prev_time = None
     fps = 0
     pre_endtime = None
@@ -757,30 +801,52 @@ def init_app():
 
 
     @app.on_event("startup")
-    def start_threads():
+    def start_workers():
         """preprocess workers"""
-        Proc(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
-                         daemon=True).start()
-        # Proc(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", \
-        #                  daemon=True).start()
+        w_streams = {
+            stream.idx: {
+                "input_frames_queue": stream.input_frames_queue,
+                "inference_queue": stream.inference_queue,
+            } \
+            for _key, stream in streams.items()
+        }
+        Proc(target=yolo_preprocess_worker,  name="yolo_preprocess_worker", daemon=True, \
+             kwargs={"stop_event": stop_event, "w_streams": w_streams}).start()
 
-        stream_ids = []
-        """inference workers"""
-        stream_ids = [0]
-        Proc(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0", \
-                         daemon=True, kwargs={"device": "musa:0", "stream_ids": stream_ids}).start()
-        stream_ids = [1,2,3]
-        Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0", \
-                         daemon=True, kwargs={"device": "npu:0",  "stream_ids": stream_ids}).start()
-        stream_ids = [1,2,3]
-        Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1", \
-                         daemon=True, kwargs={"device": "npu:1",  "stream_ids": stream_ids}).start()
+        """gpu inference workers"""
+        w_streams = {
+            key: {
+                "inference_queue": stream.inference_queue,
+                "model_output_queue": stream.model_output_queue
+            } \
+            for key, stream in streams.items() if key in [0]
+        }
+        Proc(target=yolo_inference_worker,   name="yolo_inference_worker:musa:0", daemon=True, \
+             kwargs={"stop_event": stop_event, "device": "musa:0", "w_streams": w_streams}).start()
+
+        """npu inference workers"""
+        w_streams = {
+            key: {
+                "inference_queue": stream.inference_queue,
+                "model_output_queue": stream.model_output_queue
+            } \
+            for key, stream in streams.items() if key in [0]
+        }
+        Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:0", daemon=True, \
+             kwargs={"stop_event": stop_event, "device": "npu:0",  "w_streams": w_streams}).start()
+        Proc(target=yolo_inference_worker,   name="yolo_inference_worker:npu:1", daemon=True, \
+             kwargs={"stop_event": stop_event, "device": "npu:1",  "w_streams": w_streams}).start()
 
         """postprocess workers"""
-        Proc(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
-                         daemon=True).start()
-        # Proc(target=yolo_postprocess_worker, name="yolo_postprocess_worker", \
-        #                  daemon=True).start()
+        w_streams = {
+            key: {
+                "model_output_queue": stream.model_output_queue,
+                "output_queue": stream.output_queue,
+            } \
+            for key, stream in streams.items()
+        }
+        Proc(target=yolo_postprocess_worker, name="yolo_postprocess_worker", daemon=True, \
+             kwargs={"stop_event": stop_event, "w_streams": w_streams}).start()
 
 
     @app.on_event("shutdown")
